@@ -154,6 +154,12 @@ export interface DateRange {
   start: string; // YYYY-MM-DD
   end: string; // YYYY-MM-DD
   label: string;
+  /**
+   * The natural period to compare against, e.g. last week → the 7 days before
+   * it, this month so far → the same days of last month, last weekend → the
+   * weekend before. Used for "vs the previous period" and trend summaries.
+   */
+  previous?: DateRange;
 }
 
 const MONTH_NAMES = [
@@ -161,22 +167,46 @@ const MONTH_NAMES = [
   "july", "august", "september", "october", "november", "december",
 ];
 
+// Seasons follow the meteorological calendar for the Northern Hemisphere,
+// where most orders ship: spring Mar–May, summer Jun–Aug, autumn Sep–Nov,
+// winter Dec–Feb. On 21 Sep 2025 that makes "this season" autumn (1–21 Sep).
+const SEASON_START_MONTH = { spring: 3, summer: 6, autumn: 9, fall: 9, winter: 12 } as const;
+type Season = keyof typeof SEASON_START_MONTH;
+
 /**
  * Turns a phrase (or a whole question) into an inclusive date range relative to
  * TODAY. Returns null when the text has no date wording, which callers treat as
- * "the whole dataset".
+ * "the whole dataset". Each range also carries `previous`, the period to
+ * compare it with.
  *
  * Rolling periods end today and count today as a full day:
  *   "last week" / "past week" / "last 7 days" → 15 Sep – 21 Sep 2025
  *   "last 3 days"                              → 19 Sep – 21 Sep 2025
  *   "last month" / "past month"                → 22 Aug – 21 Sep 2025 (same rule as weeks)
+ *   "week before last"                         → 8 Sep – 14 Sep 2025
+ *   "recently" / "lately"                      → last 4 weeks, 25 Aug – 21 Sep 2025
  * Calendar periods:
  *   "this week"  → Monday of this week to today (15 Sep – 21 Sep 2025)
  *   "this month" / "month to date" → 1 Sep – 21 Sep 2025
  *   "previous calendar month" → 1 Aug – 31 Aug 2025
+ *   "this weekend" → 20–21 Sep; "last weekend" → 13–14 Sep; "weekend before last" → 6–7 Sep
+ *     (today is a Sunday, so "this weekend" is the one happening now)
+ *   "Q3" / "Q3 so far" / "this quarter" → 1 Jul – 21 Sep 2025
+ *   "summer" → 1 Jun – 31 Aug 2025; "this season" → autumn so far, 1 – 21 Sep 2025;
+ *   "since the start of summer" → 1 Jun – 21 Sep 2025
  *   "in July", "June to August", "2025-07-01 to 2025-07-15", "since August"
+ *
+ * For "X vs Y" questions, X is the period returned here; see resolveComparison() for Y.
  */
 export function resolveDateRange(text: string, today: string = TODAY): DateRange | null {
+  // "last month compared to the month before": the period asked about comes
+  // first. If that part has no dates ("compare Canada vs the US this season"),
+  // read the whole text.
+  const { main } = splitComparison(text);
+  return resolveSingle(main, today) ?? (main !== text ? resolveSingle(text, today) : null);
+}
+
+function resolveSingle(text: string, today: string): DateRange | null {
   const t = text.toLowerCase();
 
   if (/\b(all[- ]time|ever|overall|entire|whole dataset|all data)\b/.test(t)) return null;
@@ -185,16 +215,20 @@ export function resolveDateRange(text: string, today: string = TODAY): DateRange
   const iso = t.match(/\d{4}-\d{2}-\d{2}/g);
   if (iso) {
     if (/\bsince\b|\bfrom\b/.test(t) && iso.length === 1) {
-      return range(iso[0], today, `${fmt(iso[0])} – ${fmt(today)}`);
+      return withShift(range(iso[0], today, `${fmt(iso[0])} – ${fmt(today)}`));
     }
     const [a, b = a] = [...iso].sort();
-    return range(a, b, a === b ? fmt(a) : `${fmt(a)} – ${fmt(b)}`);
+    return withShift(range(a, b, a === b ? fmt(a) : `${fmt(a)} – ${fmt(b)}`));
   }
 
-  if (/\btoday\b/.test(t)) return range(today, today, `today (${fmt(today)})`);
+  if (/\btoday\b/.test(t)) return withShift(range(today, today, `today (${fmtDay(today)})`));
+  if (/\bday before yesterday\b/.test(t)) {
+    const d = addDays(today, -2);
+    return withShift(range(d, d, fmtDay(d)));
+  }
   if (/\byesterday\b/.test(t)) {
     const y = addDays(today, -1);
-    return range(y, y, `yesterday (${fmt(y)})`);
+    return withShift(range(y, y, `yesterday (${fmtDay(y)})`));
   }
 
   // "last 10 days", "past 2 weeks", "previous 3 months"
@@ -203,38 +237,106 @@ export function resolveDateRange(text: string, today: string = TODAY): DateRange
 
   if (/\b(?:previous|prior|last) calendar month\b/.test(t)) {
     const end = addDays(`${today.slice(0, 7)}-01`, -1);
-    return range(`${end.slice(0, 7)}-01`, end, monthLabel(end));
+    return calendarMonths(end.slice(0, 7), end.slice(0, 7));
+  }
+
+  // Weekends (Saturday–Sunday). Checked before "last week" because the wording overlaps.
+  if (/\bweekend before last\b/.test(t)) return weekend(addDays(lastWeekendStart(today), -7), today);
+  if (/\b(?:last|past|previous) weekend\b/.test(t)) return weekend(lastWeekendStart(today), today);
+  if (/\bweekend\b/.test(t)) return weekend(thisWeekendStart(today), today);
+
+  if (/\bweek before last\b/.test(t)) {
+    const end = addDays(today, -7);
+    const start = addDays(end, -6);
+    return withShift(range(start, end, `week before last (${fmt(start)} – ${fmt(end)})`));
   }
   if (/\bthis week\b|\bweek to date\b|\bwtd\b/.test(t)) {
     const start = weekStart(today);
-    return range(start, today, `this week (${fmt(start)} – ${fmt(today)})`);
+    // Compare with the same days of last week.
+    return { ...range(start, today, `this week (${fmt(start)} – ${fmt(today)})`), previous: daysEarlier(start, today, 7, "same days last week") };
   }
   if (/\bthis month\b|\bmonth to date\b|\bmtd\b/.test(t)) {
     const start = `${today.slice(0, 7)}-01`;
-    return range(start, today, `this month (${fmt(start)} – ${fmt(today)})`);
+    return { ...range(start, today, `this month (${fmt(start)} – ${fmt(today)})`), previous: monthsEarlier(start, today, 1, "same days last month") };
   }
+
+  // Quarters: "Q3", "Q3 2025", "Q3 so far", "this quarter", "QTD".
+  const q = t.match(/\bq([1-4])(?:\s+(\d{4}))?\b/);
+  if (q || /\b(?:this|current) quarter\b|\bquarter to date\b|\bqtd\b/.test(t)) {
+    const current = Math.ceil(Number(today.slice(5, 7)) / 3);
+    const quarter = q ? Number(q[1]) : current;
+    let year = q?.[2] ? Number(q[2]) : Number(today.slice(0, 4));
+    if (!q?.[2] && quarter > current) year -= 1;
+    const start = `${year}-${String(quarter * 3 - 2).padStart(2, "0")}-01`;
+    const fullEnd = addDays(addMonths(start, 3), -1);
+    const end = fullEnd > today ? today : fullEnd;
+    const label = `Q${quarter} ${year}${end < fullEnd ? " so far" : ""} (${fmt(start)} – ${fmt(end)})`;
+    return { ...range(start, end, label), previous: monthsEarlier(start, end, 3, "same days of the previous quarter") };
+  }
+
+  // Seasons: "this season", "summer", "since the start of summer".
+  if (/\b(?:this|current) season\b/.test(t)) return season(currentSeason(today), today, false);
+  // Only in date-like wording, so "winter jackets" or "summer dresses" aren't read as dates.
+  const s =
+    t.match(/\b(?:in|during|this|last|since|over|for|through|until|throughout|(?:start|beginning|end) of)\s+(?:the\s+)?(spring|summer|autumn|fall|winter)\b/) ??
+    t.match(/\b(spring|summer|autumn|fall|winter)\s+(?:\d{4}|so far)\b/) ??
+    t.match(/^\s*(spring|summer|autumn|fall|winter)\s*$/);
+  if (s) return season(s[1] as Season, today, /\bsince\b/.test(t));
+
   if (/\b(?:this year|year to date|ytd)\b/.test(t)) {
     const start = `${today.slice(0, 4)}-01-01`;
-    return range(start, today, `year to date (${fmt(start)} – ${fmt(today)})`);
+    return { ...range(start, today, `year to date (${fmt(start)} – ${fmt(today)})`), previous: monthsEarlier(start, today, 12, "same days last year") };
   }
   if (/\b(?:last|past|previous) (?:week|7 days)\b/.test(t)) return rolling(1, "week", today);
   if (/\b(?:last|past|previous) (?:month|30 days)\b/.test(t)) return rolling(1, "month", today);
   if (/\b(?:last|past|previous) quarter\b/.test(t)) return rolling(3, "month", today);
   if (/\b(?:last|past|previous) year\b/.test(t)) return rolling(12, "month", today);
+  if (/\b(?:recent(?:ly)?|lately|of late)\b/.test(t)) {
+    const r = rolling(4, "week", today);
+    return { ...r, label: `recently, last 4 weeks (${fmt(r.start)} – ${fmt(r.end)})` };
+  }
 
   // Month names: "in July", "June to August", "since August", "September 2025".
   const months = findMonths(t, today);
   if (months.length) {
     const first = months[0];
     const last = months[months.length - 1];
-    const start = `${first}-01`;
-    if (/\bsince\b/.test(t)) return range(start, today, `${fmt(start)} – ${fmt(today)}`);
-    const end = endOfMonth(last);
-    const label = first === last ? monthLabel(start) : `${monthLabel(start)} – ${monthLabel(end)}`;
-    return range(start, end, label);
+    if (/\bsince\b/.test(t)) {
+      const start = `${first}-01`;
+      return withShift(range(start, today, `${fmt(start)} – ${fmt(today)}`));
+    }
+    return calendarMonths(first, last);
   }
 
   return null;
+}
+
+/**
+ * The period a question compares against, for "last month vs the month
+ * before", "this month compared to last month", "last weekend vs the weekend
+ * before that". Returns null when the question doesn't compare two periods
+ * (e.g. "Canada vs the US" compares countries, not dates).
+ *
+ * Relative wording ("the month before", "last month", "the weekend before
+ * that") means the main period's natural `previous`. Named periods ("vs July",
+ * "vs Q2", "vs summer") are resolved on their own.
+ */
+export function resolveComparison(text: string, main: DateRange | null = resolveDateRange(text), today: string = TODAY): DateRange | null {
+  const { other } = splitComparison(text);
+  if (!other || !main) return null;
+  const o = other.trim().toLowerCase();
+  const isPeriod = /^(?:the |a |an )?(?:same |previous |prior |last |this |one |two |week|weekend|month|day|year|quarter|period|season|spring|summer|autumn|fall|winter|before|q[1-4]\b|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|\d{4}-)/;
+  if (!isPeriod.test(o)) return null;
+  const named = /\b(?:jan(?:uary)?|feb(?:ruary)?|march|apr(?:il)?|june?|july?|aug(?:ust)?|sept?(?:ember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?|q[1-4]|spring|summer|autumn|fall|winter|\d{4}-\d{2}-\d{2})\b/;
+  if (named.test(o)) return resolveSingle(o, today) ?? main.previous ?? null;
+  return main.previous ?? null;
+}
+
+/** Splits "X vs Y" / "X compared to Y" into its two sides. */
+export function splitComparison(text: string): { main: string; other?: string } {
+  const m = text.match(/\b(?:vs\.?|versus|compared (?:to|with)|against)(?=\s|$)/i);
+  if (!m || m.index === undefined) return { main: text };
+  return { main: text.slice(0, m.index), other: text.slice(m.index + m[0].length) };
 }
 
 function rolling(n: number, unit: "day" | "week" | "month", today: string): DateRange {
@@ -244,7 +346,86 @@ function rolling(n: number, unit: "day" | "week" | "month", today: string): Date
     : unit === "week" ? addDays(today, -(7 * n - 1))
     : addDays(addMonths(today, -n), 1);
   const word = n === 1 ? unit : `${n} ${unit}s`;
-  return range(start, today, `last ${word} (${fmt(start)} – ${fmt(today)})`);
+  return withShift(range(start, today, `last ${word} (${fmt(start)} – ${fmt(today)})`));
+}
+
+/** Whole calendar months from `first` to `last` (YYYY-MM), compared with the same number of months before. */
+function calendarMonths(first: string, last: string): DateRange {
+  const start = `${first}-01`;
+  const end = endOfMonth(last);
+  const label = first === last ? monthLabel(start) : `${monthLabel(start)} – ${monthLabel(end)}`;
+  const count = (Number(last.slice(0, 4)) - Number(first.slice(0, 4))) * 12 + Number(last.slice(5, 7)) - Number(first.slice(5, 7)) + 1;
+  const prevStart = addMonths(start, -count);
+  const prevEnd = addDays(start, -1);
+  const prevLabel = count === 1 ? monthLabel(prevStart) : `${monthLabel(prevStart)} – ${monthLabel(prevEnd)}`;
+  return { ...range(start, end, label), previous: range(prevStart, prevEnd, prevLabel) };
+}
+
+/** The Saturday of the weekend happening now (today if Saturday, yesterday if Sunday), else the most recent one. */
+function thisWeekendStart(today: string): string {
+  const dow = toDate(today).getUTCDay(); // 0 = Sunday, 6 = Saturday
+  return addDays(today, dow === 6 ? 0 : -(dow + 1));
+}
+
+/** The weekend before the current one. On a weekday, that's simply the most recent weekend. */
+function lastWeekendStart(today: string): string {
+  const dow = toDate(today).getUTCDay();
+  const current = thisWeekendStart(today);
+  return dow === 0 || dow === 6 ? addDays(current, -7) : current;
+}
+
+function weekend(saturday: string, today: string): DateRange {
+  const sunday = addDays(saturday, 1);
+  const end = sunday > today ? today : sunday;
+  const prevSat = addDays(saturday, -7);
+  return {
+    ...range(saturday, end, `weekend of ${fmt(saturday)}${end === saturday ? " (Saturday so far)" : ""}`),
+    previous: range(prevSat, addDays(prevSat, end === saturday ? 0 : 1), `weekend of ${fmt(prevSat)}`),
+  };
+}
+
+function currentSeason(today: string): Season {
+  const m = Number(today.slice(5, 7));
+  return m >= 3 && m <= 5 ? "spring" : m >= 6 && m <= 8 ? "summer" : m >= 9 && m <= 11 ? "autumn" : "winter";
+}
+
+/** The most recent occurrence of a season that has started by today. `since` runs from its start to today. */
+function season(name: Season, today: string, since: boolean): DateRange {
+  const startMonth = SEASON_START_MONTH[name];
+  const month = Number(today.slice(5, 7));
+  let year = Number(today.slice(0, 4));
+  // Winter starts in December; any other season later in the year than today means last year's.
+  if (startMonth === 12 ? month !== 12 : startMonth > month) year -= 1;
+  const start = `${year}-${String(startMonth).padStart(2, "0")}-01`;
+  const fullEnd = addDays(addMonths(start, 3), -1);
+  const end = since || fullEnd > today ? today : fullEnd;
+  const display = name === "fall" ? "autumn" : name;
+  const label =
+    since ? `since the start of ${display} (${fmt(start)} – ${fmt(end)})`
+    : `${display} ${year}${end < fullEnd ? " so far" : ""} (${fmt(start)} – ${fmt(end)})`;
+  if (since) return withShift(range(start, end, label));
+  return { ...range(start, end, label), previous: monthsEarlier(start, end, 3, "same days of the previous season") };
+}
+
+/** Previous period of the same length, ending the day before this one starts. */
+function withShift(r: DateRange): DateRange {
+  const days = Math.round((toDate(r.end).getTime() - toDate(r.start).getTime()) / 86_400_000) + 1;
+  const end = addDays(r.start, -1);
+  const start = addDays(r.start, -days);
+  const label = days === 1 ? `previous day (${fmtDay(start)})` : `previous ${days} days (${fmt(start)} – ${fmt(end)})`;
+  return { ...r, previous: range(start, end, label) };
+}
+
+function daysEarlier(start: string, end: string, days: number, what: string): DateRange {
+  const s = addDays(start, -days);
+  const e = addDays(end, -days);
+  return range(s, e, `${what} (${fmt(s)} – ${fmt(e)})`);
+}
+
+function monthsEarlier(start: string, end: string, months: number, what: string): DateRange {
+  const s = addMonths(start, -months);
+  const e = addMonths(end, -months);
+  return range(s, e, `${what} (${fmt(s)} – ${fmt(e)})`);
 }
 
 /** Returns YYYY-MM keys for every month name mentioned, in the order written. */
@@ -298,6 +479,11 @@ export function weekStart(iso: string): string {
 
 function fmt(iso: string): string {
   return toDate(iso).toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric", timeZone: "UTC" });
+}
+
+/** "Fri 19 Sept 2025": weekday included, for single days and weekends. */
+function fmtDay(iso: string): string {
+  return toDate(iso).toLocaleDateString("en-GB", { weekday: "short", day: "numeric", month: "short", year: "numeric", timeZone: "UTC" });
 }
 
 function monthLabel(iso: string): string {
@@ -678,7 +864,9 @@ export function describeDataset(lines: OrderLine[] = loadOrderLines()) {
       orders: distinct("order_id").length,
       products: distinct("product_id").length,
     },
-    dateRules: "Dates are inclusive; rolling periods end on today (2025-09-21). 'Last week' = 2025-09-15 to 2025-09-21.",
+    dateRules:
+      "Dates are inclusive; rolling periods end on today (2025-09-21). 'Last week' = 2025-09-15 to 2025-09-21. " +
+      "Seasons are meteorological (summer = Jun–Aug). Weekends are Saturday–Sunday.",
   };
 }
 
