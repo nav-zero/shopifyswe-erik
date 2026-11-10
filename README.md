@@ -1,16 +1,39 @@
 # Merchant Analytics
 
-A dashboard where a merchant asks questions about their store in plain English and gets charts back. Ask "how did sales trend last month compared to the month before?" or "show units sold next to inventory on hand", and the answer comes back as a line chart, bar chart, table or metric cards, built from the store's order data.
+**Live dashboard: [shopifyswe-erik.vercel.app](https://shopifyswe-erik.vercel.app)**
+
+Merchant Analytics lets a store owner ask questions about their sales in plain English and get charts back, without building reports or knowing where the numbers live. Type "how did sales trend last month compared to the month before?" or "show units sold next to inventory on hand", and the answer comes back as a line chart, bar chart, table or metric cards, built from the store's order data.
+
+## What it's for
+
+Merchants make day-to-day decisions from a handful of recurring questions, and answering them usually means exporting data and building a spreadsheet. The dashboard answers them directly:
+
+- **Is the business growing?** Sales trends by day, week or month, and any period against the one before.
+- **What's selling, and what's slowing down?** Products and SKUs ranked by revenue or units, and which ones are speeding up, slowing down or have stopped selling.
+- **Where do sales come from?** Revenue split by sales channel (Online Store, Shop, Point of Sale, Instagram) and by shipping country.
+- **What's being returned?** Refund totals, refund rates and the products driving them.
+- **What needs reordering?** Units sold next to inventory on hand, with roughly how many days of stock are left.
+- **Headline numbers:** total net revenue, units, orders or average order value for any period.
+
+Questions can build on each other: each new one adds a chart to the current dashboard, so a merchant can put together a view of their week and come back to it from the history sidebar. When a question is too vague to chart, such as "what's slowing down since summer?" or a product that isn't in the store, the dashboard asks a clarifying question with options instead of guessing. Small typos like "jakets" are corrected automatically.
 
 The data is the merchant order history in [`data/`](data/): 3,000 order line items from 1 June to 21 September 2025.
 
+## Limits of this prototype
+
+- **Fixed data set.** Every answer comes from one CSV export of orders from 1 June to 21 September 2025. It isn't connected to a live store, so new orders don't appear.
+- **Time is locked at 21 September 2025.** "Today", "last week" and "this month" all count back from that date, the last day in the data. The Update button and the `ANALYTICS_TODAY` setting are ready for live dates, but with this data later dates would show empty charts.
+- **Static search.** The search box answers a fixed set of question types, each with a predefined chart: the ones listed under [What it can answer](#what-it-can-answer). It can't run open-ended analysis, explain *why* something happened, or answer questions outside those types.
+- **No ad spend.** There's no marketing, traffic, cost or profit data, so questions about ad spend, ROAS, conversion rate, margins or website visits get "Sorry, I can't answer that because I don't have the data." The same goes for product details the export doesn't include, like colours and sizes.
+
 ## How it works
 
-1. The merchant types a question on the home page.
+1. The merchant types a question on the home page. Small typos in product, category, channel and country names are corrected first ("jakets" → "jackets"), and the dashboard notes the correction.
 2. Questions about data the store doesn't have (ad spend, traffic, costs, profit, reviews) get a fixed reply straight away, without calling the model: *"Sorry, I can't answer that because I don't have the data."*, plus two questions it can answer.
-3. Common question shapes ("top 5 products this week", "sales by channel last month", "total revenue last week", "which products are running low on stock") are matched by rules in [`src/lib/router.ts`](src/lib/router.ts), which pick the tool directly. No model call, so these are instant and don't use the free model's daily allowance.
-4. Anything the rules can't read confidently, and follow-ups like "now show it by channel", go to a language model ([`google/gemma-4-26b-a4b-it:free`](https://openrouter.ai/google/gemma-4-26b-a4b-it:free) on OpenRouter). Its only job is to pick a tool and pass the user's own words for the time period, such as "last week". It never writes the answer itself, so it can't make up numbers.
-5. The tool computes the numbers from the CSV and returns a description of the visual. The dashboard draws it.
+3. Questions too vague to chart get a clarifying question with options: seasons instead of dates ("since summer", "this season"), a comparison with only one side ("slowed down compared to July"), or a product that isn't in the store ("the Big Cozy"). Picking an option, or exact dates, re-asks the question with the answer filled in.
+4. Common question shapes ("top 5 products this week", "sales by channel last month", "total revenue last week", "which products are running low on stock") are matched by rules in [`src/lib/router.ts`](src/lib/router.ts), which pick the tool directly. No model call, so these are instant and don't use the free model's daily allowance.
+5. Anything the rules can't read confidently, and follow-ups like "now show it by channel", go to a language model ([`google/gemma-4-26b-a4b-it:free`](https://openrouter.ai/google/gemma-4-26b-a4b-it:free) on OpenRouter). Its only job is to pick a tool and pass the user's own words for the time period, such as "last week". It never writes the answer itself, so it can't make up numbers.
+6. The tool computes the numbers from the CSV and returns a description of the visual. The dashboard draws it.
 
 Each new question adds to the current dashboard. **New search** starts a fresh one, and past dashboards are listed in the history sidebar. History is saved in the browser.
 
@@ -21,13 +44,14 @@ The question types, with real example questions and the tool call each should ma
 | Question type | Visual | Example |
 |---|---|---|
 | Sales over time | Line | "trend of weekly sales since june, are we actually growing" |
-| Sales by country over time | Line | "compare sales in canada vs the US this season" |
+| Sales by country over time | Line | "compare sales in canada vs the US last month" |
 | Sales by channel over time | Line | "how much of my revenue came from online store vs pos last month" |
 | Products by revenue | Bar | "top 5 products this week by revenue" |
 | Product returns over time | Line | "refund total for Q3 so far and which items drove it" |
 | Products over time | Line or bar | "which outerwear has been slowing down recently" |
 | Totals | Metric cards | "what was total net revenue last week" |
 | Product tables | Table | "show units sold next to inventory on hand for each product" |
+| Comparing products | Line, one per product | "compare the parka and the hoodie over the past few weeks" |
 
 Which visual to use is decided in code, not by the model: anything over time is a line chart, side-by-side comparisons are bar charts, several numbers per item are tables, and single totals are metric cards.
 
@@ -46,7 +70,7 @@ These live in [`src/lib/metrics.ts`](src/lib/metrics.ts) and every number goes t
 
 "Today" is fixed at **21 September 2025**, the last day in the data, so "last week" means 15–21 September. Ranges include both their first and last day.
 
-The dashboard understands rolling periods ("past 7 days", "last month", "recently"), calendar periods ("this month", "Q3 so far", "in August"), weekends, seasons ("this season", "since the start of summer") and comparisons ("vs the month before"). Every period has a natural previous period to compare against.
+The dashboard understands rolling periods ("past 7 days", "last month", "recently", "past few weeks"), calendar periods ("this month", "Q3 so far", "in August"), weekends and comparisons ("vs the month before"). Every period has a natural previous period to compare against. Seasons ("since summer", "this season") depend on hemisphere and definition, so the dashboard asks for exact dates instead.
 
 The **Update** button re-runs every chart on the dashboard for the current "today", without calling the model. To make dates follow the real calendar, set `ANALYTICS_TODAY=today`. Until the data runs up to the present day, that will give empty charts.
 
@@ -76,7 +100,7 @@ Then add your OpenRouter key to `.env.local`:
 | `npm run dev` | Start the app for development. |
 | `npm run build` | Production build. |
 | `npm run lint` | Lint the code. |
-| `npm run check:guide` | Check every example in the question guide: its inputs are valid, its tool runs on the data, it returns the right kind of visual, and the rules pick the same tool (or leave it to the model). Also checks every question the dashboard suggests is answered by the rules. No model calls. |
+| `npm run check:guide` | Check every example in the question guide: its inputs are valid, its tool runs on the data, it returns the right kind of visual, and the rules pick the same tool (or leave it to the model). Vague examples must ask the expected clarifying question and, once answered, reach the expected chart. Also checks every question the dashboard suggests is answered by the rules. No model calls. |
 | `npm run check:guide -- --live` | Also ask the model, through the running app, about the examples the rules leave to it. |
 | `npm run check:guide -- --live-all` | Ask the model about every example, skipping the rules. Uses about 23 of the 50 free daily requests. |
 
@@ -95,6 +119,9 @@ src/app/api/chat/            Streams tool results for a question
 src/app/api/refresh/         Re-runs saved charts for the Update button
 src/components/dashboard/    Dashboard, question cards, loader, visuals
 src/lib/metrics.ts           Data loading, definitions, date rules
+src/lib/plan.ts              The order a question goes through: typos, no-data, clarify, rules, model
+src/lib/fuzzy.ts             Typo correction and name similarity
+src/lib/clarify.ts           Clarifying questions for vague dates and unknown products
 src/lib/router.ts            Rules that answer common questions without the model
 src/lib/chat-tools.ts        The tools that compute each visual
 src/lib/question-guide.ts    Question types and examples the model learns from
