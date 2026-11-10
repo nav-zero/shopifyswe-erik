@@ -33,9 +33,12 @@ export interface OrderLine {
   sku: string; // G  sku
   productCategory: string; // H  product_category
   quantity: number; // I  quantity
-  unitPrice: number; // J  unit_price
-  discountAmount: number; // K  discount_amount — also our "refunds" figure, see METRIC_DEFINITIONS
-  lineTotal: number; // L  line_total — GROSS sales (unit_price × quantity, before discount)
+  // Prices in this export are AFTER discount. We know because some rows have a
+  // discount larger than their line_total, which can't happen if line_total
+  // were the pre-discount amount.
+  unitPrice: number; // J  unit_price — per-unit price AFTER discount
+  discountAmount: number; // K  discount_amount — discount already taken off line_total
+  lineTotal: number; // L  line_total — NET sales (unit_price × quantity, after discount)
   salesChannel: string; // M  sales_channel
   shippingCountry: string; // N  shipping_country (ISO-2 code)
   financialStatus: string; // O  financial_status
@@ -308,7 +311,10 @@ function monthLabel(iso: string): string {
 export const METRICS = [
   "netSales",
   "grossSales",
+  "discounts",
   "refunds",
+  "refundedUnits",
+  "partiallyRefundedLineItems",
   "units",
   "lineItems",
   "orders",
@@ -325,21 +331,34 @@ export const METRIC_DEFINITIONS: Record<Metric, { label: string; definition: str
   netSales: {
     label: "Net sales",
     // "Sales" always means NET sales unless someone explicitly asks for gross.
-    // line_total is gross (unit_price × quantity), so we subtract the discount.
-    definition: "line_total − discount_amount. This is what 'sales' means by default.",
+    // line_total is already after discount, so it is net sales as-is.
+    // Refunds are NOT taken off: refunded lines still count here.
+    definition: "line_total (already after discount). This is what 'sales' means by default.",
   },
   grossSales: {
     label: "Gross sales",
     // Only used when the question says "gross" or "before discount".
-    definition: "line_total (unit_price × quantity, before any discount).",
+    // line_total is after discount, so we add the discount back.
+    definition: "line_total + discount_amount (before any discount).",
   },
+  discounts: { label: "Discounts", definition: "Sum of discount_amount." },
   refunds: {
     label: "Refunds",
-    // Agreed definition: refunds are read from discount_amount (column K).
-    // Note: every row has a non-zero discount_amount, including "paid" rows, so
-    // this is also the total discount. financial_status (refunded /
-    // partially_refunded) is available as a filter if you need refund-status rows only.
-    definition: "Sum of discount_amount.",
+    // Only fully refunded lines (financial_status = "refunded") have a known
+    // amount: the whole line_total went back to the customer.
+    // Partially refunded lines are left out on purpose: the export doesn't
+    // say how much was refunded, so any figure would be a guess. They are
+    // counted in partiallyRefundedLineItems instead.
+    definition: "Sum of line_total where financial_status = 'refunded'. Excludes partial refunds, whose amounts are unknown.",
+  },
+  refundedUnits: {
+    label: "Refunded units",
+    definition: "Sum of quantity where financial_status = 'refunded'.",
+  },
+  partiallyRefundedLineItems: {
+    label: "Partially refunded line items",
+    // We know these were partly refunded, but not by how much, so we only count them.
+    definition: "Number of rows with financial_status = 'partially_refunded'. The refunded amount is not in the data.",
   },
   units: { label: "Units sold", definition: "Sum of quantity." },
   lineItems: { label: "Line items", definition: "Number of CSV rows." },
@@ -354,7 +373,9 @@ export const METRIC_DEFINITIONS: Record<Metric, { label: string; definition: str
 };
 
 /** Metrics that add up across groups, so a group's share of the total is meaningful. */
-const ADDITIVE: ReadonlySet<Metric> = new Set(["netSales", "grossSales", "refunds", "units", "lineItems"]);
+const ADDITIVE: ReadonlySet<Metric> = new Set([
+  "netSales", "grossSales", "discounts", "refunds", "refundedUnits", "partiallyRefundedLineItems", "units", "lineItems",
+]);
 
 /** Every column you can group by or filter on. */
 export const DIMENSIONS = {
@@ -413,19 +434,29 @@ export interface MetricsResult {
 }
 
 interface Accumulator {
-  gross: number;
+  net: number;
   discount: number;
+  refunded: number;
+  refundedUnits: number;
+  partialLines: number;
   units: number;
   lines: number;
   orders: Set<string>;
   customers: Set<string>;
 }
 
-const newAcc = (): Accumulator => ({ gross: 0, discount: 0, units: 0, lines: 0, orders: new Set(), customers: new Set() });
+const newAcc = (): Accumulator => ({
+  net: 0, discount: 0, refunded: 0, refundedUnits: 0, partialLines: 0, units: 0, lines: 0, orders: new Set(), customers: new Set(),
+});
 
 function add(acc: Accumulator, l: OrderLine) {
-  acc.gross += l.lineTotal;
+  acc.net += l.lineTotal; // line_total is already after discount
   acc.discount += l.discountAmount;
+  if (l.financialStatus === "refunded") {
+    acc.refunded += l.lineTotal;
+    acc.refundedUnits += l.quantity;
+  }
+  if (l.financialStatus === "partially_refunded") acc.partialLines += 1;
   acc.units += l.quantity;
   acc.lines += 1;
   acc.orders.add(l.orderId);
@@ -433,11 +464,14 @@ function add(acc: Accumulator, l: OrderLine) {
 }
 
 function finalize(acc: Accumulator): MetricValues {
-  const net = acc.gross - acc.discount;
+  const net = acc.net;
   return {
     netSales: round2(net),
-    grossSales: round2(acc.gross),
-    refunds: round2(acc.discount),
+    grossSales: round2(acc.net + acc.discount),
+    discounts: round2(acc.discount),
+    refunds: round2(acc.refunded),
+    refundedUnits: acc.refundedUnits,
+    partiallyRefundedLineItems: acc.partialLines,
     units: acc.units,
     lineItems: acc.lines,
     orders: acc.orders.size,
@@ -534,12 +568,17 @@ function dataNotes(matched: OrderLine[], metrics: Metric[], dateRange: DateRange
     return notes;
   }
   if (dateRange) notes.push(`Dates are inclusive: ${fmt(dateRange.start)} to ${fmt(dateRange.end)}, with today taken as ${fmt(TODAY)}.`);
-  if (metrics.includes("netSales") || metrics.includes("avgOrderValue")) {
-    const negative = matched.filter((l) => l.discountAmount > l.lineTotal).length;
-    if (negative) notes.push(`${negative} line item(s) have a discount larger than their line total, so their net sales are negative.`);
-  }
-  if (metrics.includes("refunds")) {
-    notes.push("Refunds are the sum of discount_amount. Every row carries a discount, including paid orders; filter on financial_status for refunded orders only.");
+  if (metrics.some((m) => m === "refunds" || m === "refundedUnits" || m === "partiallyRefundedLineItems")) {
+    notes.push("Refunds only cover fully refunded line items (their whole line_total).");
+    const partial = matched.filter((l) => l.financialStatus === "partially_refunded");
+    if (partial.length) {
+      // Show the ceiling so nobody mistakes "unknown" for "zero".
+      const ceiling = round2(partial.reduce((s, l) => s + l.lineTotal, 0));
+      notes.push(
+        `${partial.length} line item(s) were partially refunded, but the export doesn't say how much, so they are not in the refunds figure. ` +
+          `The refunded amount is somewhere between 0 and their combined line total of ${formatMetric("netSales", ceiling)}.`,
+      );
+    }
   }
   if (metrics.includes("orders") || metrics.includes("avgOrderValue")) {
     notes.push("Order counts are approximate: the same order_id appears with different customers or dates in this export.");
@@ -734,7 +773,7 @@ const COUNT_OF = (noun: string) => new RegExp(`\\b(how many|number of|count of|t
 
 function detectMetrics(body: string): Metric[] {
   if (/\b(overview|summary|kpis?|how are we doing|how did we do|performance|snapshot)\b/.test(body)) {
-    return ["netSales", "grossSales", "refunds", "units", "orders", "customers", "avgOrderValue"];
+    return ["netSales", "grossSales", "discounts", "refunds", "partiallyRefundedLineItems", "units", "orders", "customers", "avgOrderValue"];
   }
   const found: Metric[] = [];
   let rest = body;
@@ -745,9 +784,17 @@ function detectMetrics(body: string): Metric[] {
     found.push("grossSales");
     rest = rest.replace(gross, " ");
   }
+  if (/\bdiscount(s|ed)?\b/.test(rest)) found.push("discounts");
   // "refunded orders" is a financial_status filter, not a request for the refunds metric.
-  if (/\b(refunds?|refunded|discounts?|returns?)\b/.test(rest.replace(/\b(partially[- ])?refunded (orders|items|lines)\b/g, " "))) found.push("refunds");
-  if (/\b(quantit(y|ies)|units?|pieces|volume|most sold|sold the most|best[- ]?sell(ing|er|ers)?|how many (items|products))\b/.test(rest)) found.push("units");
+  const refundText = rest.replace(/\b(partially[- ])?refunded (orders|items|lines)\b/g, " ");
+  const asksUnits = /\b(quantit(y|ies)|units?|pieces|volume|most sold|sold the most|best[- ]?sell(ing|er|ers)?|how many (items|products))\b/.test(rest);
+  if (/\bpartial(ly)?[- ]refund/.test(rest)) {
+    // Partial refund amounts aren't in the data, so all we can give is a count.
+    found.push("partiallyRefundedLineItems");
+  } else if (/\b(refunds?|refunded|returns?|returned)\b/.test(refundText)) {
+    // Always show the partial-refund count beside refunds, so it's clear what the figure leaves out.
+    found.push(asksUnits ? "refundedUnits" : "refunds", "partiallyRefundedLineItems");
+  } else if (asksUnits) found.push("units");
   if (/\b(aov|average order (value|size)|basket size)\b/.test(rest)) found.push("avgOrderValue");
   else if (COUNT_OF("orders").test(rest) || /\b(order count|most orders)\b/.test(rest)) found.push("orders");
   if (COUNT_OF("customers").test(rest) || /\bcustomer count\b/.test(rest)) found.push("customers");
@@ -884,8 +931,12 @@ function summarize(r: MetricsResult): string {
   return [header, ...lines, `Total: ${describe(r.totals)}`].join("\n");
 }
 
+const COUNT_METRICS: ReadonlySet<Metric> = new Set([
+  "units", "refundedUnits", "partiallyRefundedLineItems", "lineItems", "orders", "customers",
+]);
+
 export function formatMetric(metric: Metric, value: number): string {
-  if (metric === "units" || metric === "lineItems" || metric === "orders" || metric === "customers") {
+  if (COUNT_METRICS.has(metric)) {
     return value.toLocaleString("en-US");
   }
   // Amounts are in the store's currency; the export doesn't say which.
