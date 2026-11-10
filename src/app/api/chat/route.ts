@@ -29,18 +29,28 @@ import {
   systemPrompt,
   type ChatMessage,
 } from "@/lib/chat-tools";
+import { describeError } from "@/lib/errors";
 import { getModel } from "@/lib/openrouter";
 
 // Free models can be slow to start; give the stream room to finish.
 export const maxDuration = 60;
 
 export async function POST(req: Request) {
+  try {
+    return await answer(req);
+  } catch (error) {
+    // Fails before streaming starts (e.g. the data file can't be read): reply with the specific cause.
+    return Response.json({ error: friendlyError(error) }, { status: 500 });
+  }
+}
+
+async function answer(req: Request) {
   let messages: ChatMessage[];
   try {
     ({ messages } = await req.json());
     if (!Array.isArray(messages) || !messages.length) throw new Error();
   } catch {
-    return Response.json({ error: "Send a JSON body like { messages: [...] }." }, { status: 400 });
+    return Response.json({ error: "The request was malformed: the server expected a JSON body like { messages: [...] }." }, { status: 400 });
   }
 
   // 1. Data we don't have → fixed reply, no model call. Deterministic and free.
@@ -52,7 +62,10 @@ export async function POST(req: Request) {
   // Locally this comes from .env.local; on Vercel, from the project's environment variables.
   const apiKey = process.env.OPENROUTER_API_KEY;
   if (!apiKey) {
-    return Response.json({ error: "OPENROUTER_API_KEY isn't set on the server." }, { status: 500 });
+    return Response.json(
+      { error: "OPENROUTER_API_KEY isn't set on the server. Add it to .env.local locally, or to the project's environment variables on Vercel, then redeploy." },
+      { status: 500 },
+    );
   }
   const openrouter = createOpenRouter({ apiKey, fetch: failFastOnDailyLimit });
 
@@ -118,14 +131,12 @@ async function failFastOnDailyLimit(input: RequestInfo | URL, init?: RequestInit
   return new Response(body, { status: daily ? 402 : 429, headers: res.headers });
 }
 
-/** What the user sees if something fails mid-stream. Details go to the server log. */
+/**
+ * What the user sees when something fails mid-stream, including a tool that
+ * crashes: always the specific cause (see errors.ts). Full details go to the server log.
+ */
 function friendlyError(error: unknown): string {
-  // After retries the SDK wraps the API error, so check the last attempt too.
-  const e = error as { message?: string; statusCode?: number; lastError?: { statusCode?: number } };
-  const status = e?.statusCode ?? e?.lastError?.statusCode;
-  console.error("[api/chat]", status ?? "", e?.message ?? error);
-  if (status === 402) return "The free model's daily limit is used up. It resets at midnight UTC, or you can add OpenRouter credits to raise it.";
-  if (status === 429) return "The free model is busy right now. Please try again in a minute.";
-  if (status === 401 || status === 403) return "The server's OpenRouter key was rejected. Check OPENROUTER_API_KEY.";
-  return "Something went wrong while answering. Please try again.";
+  const message = describeError(error);
+  console.error("[api/chat]", message);
+  return message;
 }

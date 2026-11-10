@@ -60,7 +60,7 @@ export function EntryCard({
 
         {entry.status === "failed" && (
           <Card wide>
-            <Problem title="That didn't work" detail={entry.failure ?? "Something went wrong. Please try again."}>
+            <Problem title="That didn't work" detail={entry.failure ?? "This question stopped without a recorded reason."}>
               <button type="button" onClick={onRetry} className="btn-primary self-start">
                 Try again
               </button>
@@ -71,7 +71,7 @@ export function EntryCard({
         {nothing && (
           <Card wide>
             <CannotAnswer
-              reason={cannot?.output && !cannot.output.ok && !cannot.output.unsupported ? cannot.output.error : undefined}
+              reason={cannot?.output && !cannot.output.ok && !cannot.output.unsupported ? cannot.output.error : entry.reason}
               suggestions={
                 entry.suggestions ?? (cannot?.output && !cannot.output.ok && cannot.output.suggestions.length ? cannot.output.suggestions : DEFAULT_SUGGESTIONS)
               }

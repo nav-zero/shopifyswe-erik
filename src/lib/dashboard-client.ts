@@ -49,8 +49,10 @@ export interface Entry {
   results: ToolResult[];
   /** Set when the question was turned away before reaching the model. */
   suggestions?: string[];
-  /** Set when the request failed (rate limit, network). Shown with a retry button. */
+  /** Set when the request failed (rate limit, network). The specific cause, shown with a retry button. */
   failure?: string;
+  /** Why nothing could be shown when the question finished without a visual (e.g. the model chose no chart). */
+  reason?: string;
   askedAt: string;
 }
 
@@ -151,7 +153,7 @@ export async function askQuestion(
   history: Entry[],
   onResult: (r: ToolResult) => void,
   signal?: AbortSignal,
-): Promise<{ results: ToolResult[]; suggestions?: string[] }> {
+): Promise<{ results: ToolResult[]; suggestions?: string[]; reason?: string }> {
   const messages = [];
   // Earlier questions on this dashboard, and what was shown for them. Last few only, to keep the prompt small.
   for (const e of history.filter((h) => h.status === "done").slice(-4)) {
@@ -161,13 +163,9 @@ export async function askQuestion(
   }
   messages.push({ id: newId(), role: "user", parts: [{ type: "text", text: question }] });
 
-  const res = await fetch("/api/chat", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ messages }),
-    signal,
-  });
-  if (!res.ok || !res.body) throw new Error(res.status === 429 ? "The free model is busy right now. Please try again in a minute." : "Something went wrong. Please try again.");
+  const res = await post("/api/chat", { messages }, signal);
+  if (!res.ok) throw new Error(await errorFrom(res));
+  if (!res.body) throw new Error("The server replied without an answer body. Try again.");
 
   const results = new Map<string, ToolResult>();
   let suggestions: string[] | undefined;
@@ -175,8 +173,15 @@ export async function askQuestion(
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
+  let finished = false;
   for (;;) {
-    const { done, value } = await reader.read();
+    let chunk: ReadableStreamReadResult<Uint8Array>;
+    try {
+      chunk = await reader.read();
+    } catch (err) {
+      throw new Error(`The connection to the server dropped while the answer was loading (${(err as Error).message}). Try again.`);
+    }
+    const { done, value } = chunk;
     if (done) break;
     buffer += decoder.decode(value, { stream: true });
     const lines = buffer.split("\n");
@@ -197,21 +202,53 @@ export async function askQuestion(
         results.set(id, r);
         onResult(r);
       } else if (part.type === "tool-output-error" || part.type === "tool-input-error") {
-        // The tool itself failed (or the model sent unusable input): treat as "can't answer".
-        const r = { ...(results.get(id) ?? { toolCallId: id, tool: "unknown", input: {} }), output: { ok: false, error: "This question couldn't be answered from the data.", suggestions: [] } as ToolOutput };
+        // The tool itself failed (or the model sent unusable input): show "can't answer" with the server's specific reason.
+        const reason = String(part.errorText ?? "") || `The ${String(part.toolName ?? "chart")} tool failed without saying why.`;
+        const r = { ...(results.get(id) ?? { toolCallId: id, tool: "unknown", input: {} }), output: { ok: false, error: reason, suggestions: [] } as ToolOutput };
         results.set(id, r);
         onResult(r);
       } else if (part.type === "data-suggestions") {
         suggestions = (part.data as { questions: string[] }).questions;
       } else if (part.type === "error") {
-        streamError = String(part.errorText ?? "Something went wrong. Please try again.");
+        streamError = String(part.errorText ?? "") || "The server reported an error but didn't say what it was. Check the server logs.";
+      } else if (part.type === "finish") {
+        finished = true;
       }
     }
   }
-  const finished = [...results.values()].filter((r) => r.output);
+  const done = [...results.values()].filter((r) => r.output);
   // An error with nothing to show means the request failed (e.g. rate limit) rather than "can't answer".
-  if (streamError && !finished.length && !suggestions) throw new Error(streamError);
-  return { results: finished, suggestions };
+  if (streamError && !done.length && !suggestions) throw new Error(streamError);
+  if (!finished && !streamError && !done.length && !suggestions) {
+    throw new Error("The connection to the server closed before the answer finished. Try again.");
+  }
+  const reason =
+    !done.length && !suggestions
+      ? streamError ?? "The model didn't choose a chart for this question, so there's nothing to show. Try rephrasing it."
+      : undefined;
+  return { results: done, suggestions, reason };
+}
+
+/** fetch with a specific message when the server can't be reached at all. */
+async function post(url: string, body: unknown, signal?: AbortSignal): Promise<Response> {
+  try {
+    return await fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body), signal });
+  } catch (err) {
+    if ((err as Error).name === "AbortError") throw err;
+    throw new Error(`Couldn't reach the Merchant Analytics server (${(err as Error).message}). Check your internet connection and try again.`);
+  }
+}
+
+/** The server's own error message from a failed response, with the HTTP status. */
+async function errorFrom(res: Response): Promise<string> {
+  let text = "";
+  try {
+    text = await res.text();
+    const body = JSON.parse(text) as { error?: string };
+    if (body.error) return `${body.error} (HTTP ${res.status})`;
+  } catch {}
+  const snippet = text.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim().slice(0, 160);
+  return `The server returned HTTP ${res.status}${res.statusText ? ` ${res.statusText}` : ""}${snippet ? `: ${snippet}` : ""}.`;
 }
 
 /** Re-runs every saved visual for the current date. Returns the server's "today". */
@@ -219,8 +256,8 @@ export async function refreshDashboard(d: Dashboard): Promise<{ today: string; o
   const widgets = d.entries.flatMap((e) =>
     e.results.filter((r) => r.tool !== "cannotAnswer" && r.output?.ok).map((r) => ({ id: r.toolCallId, tool: r.tool, input: r.input, question: e.question })),
   );
-  const res = await fetch("/api/refresh", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ widgets }) });
-  if (!res.ok) throw new Error("Couldn't update the dashboard. Please try again.");
+  const res = await post("/api/refresh", { widgets });
+  if (!res.ok) throw new Error(`Couldn't update the dashboard: ${await errorFrom(res)}`);
   const body = (await res.json()) as { today: string; results: { id: string; output: ToolOutput }[] };
   return { today: body.today, outputs: new Map(body.results.map((r) => [r.id, r.output])) };
 }

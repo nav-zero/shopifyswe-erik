@@ -44,11 +44,11 @@ export function Dashboard() {
 
   async function run(dashboardId: string, entryId: string, question: string, history: Entry[]) {
     try {
-      const { results, suggestions } = await askQuestion(question, history, (r) =>
+      const { results, suggestions, reason } = await askQuestion(question, history, (r) =>
         // Show each visual as soon as it arrives.
         updateEntry(dashboardId, entryId, (e) => ({ ...e, results: [...e.results.filter((x) => x.toolCallId !== r.toolCallId), r] })),
       );
-      updateEntry(dashboardId, entryId, (e) => ({ ...e, status: "done", results, suggestions }));
+      updateEntry(dashboardId, entryId, (e) => ({ ...e, status: "done", results, suggestions, reason }));
       if (today) updateDashboard(dashboardId, (d) => ({ ...d, asOf: d.asOf ?? today }));
     } catch (err) {
       updateEntry(dashboardId, entryId, (e) => ({ ...e, status: "failed", failure: (err as Error).message }));
@@ -77,7 +77,7 @@ export function Dashboard() {
   function retry(entry: Entry) {
     if (!active || busy) return;
     const history = active.entries.slice(0, active.entries.findIndex((e) => e.id === entry.id));
-    updateEntry(active.id, entry.id, (e) => ({ ...e, status: "loading", results: [], suggestions: undefined, failure: undefined }));
+    updateEntry(active.id, entry.id, (e) => ({ ...e, status: "loading", results: [], suggestions: undefined, failure: undefined, reason: undefined }));
     void run(active.id, entry.id, entry.question, history);
   }
 

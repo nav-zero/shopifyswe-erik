@@ -11,6 +11,7 @@
  */
 
 import { runTool } from "@/lib/chat-tools";
+import { describeError } from "@/lib/errors";
 import { getToday } from "@/lib/metrics";
 
 export async function GET() {
@@ -30,10 +31,17 @@ export async function POST(req: Request) {
     ({ widgets } = await req.json());
     if (!Array.isArray(widgets) || widgets.length > 100) throw new Error();
   } catch {
-    return Response.json({ error: "Send a JSON body like { widgets: [...] } with at most 100 widgets." }, { status: 400 });
+    return Response.json({ error: "The update request was malformed: the server expected { widgets: [...] } with at most 100 charts." }, { status: 400 });
   }
   const results = await Promise.all(
-    widgets.map(async (w) => ({ id: String(w.id), output: await runTool(String(w.tool), w.input, String(w.question ?? "")) })),
+    widgets.map(async (w) => {
+      try {
+        return { id: String(w.id), output: await runTool(String(w.tool), w.input, String(w.question ?? "")) };
+      } catch (error) {
+        // One chart failing shouldn't stop the rest from updating; it shows its own specific error.
+        return { id: String(w.id), output: { ok: false, error: describeError(error), suggestions: [] } };
+      }
+    }),
   );
   return Response.json({ today: getToday(), results });
 }
