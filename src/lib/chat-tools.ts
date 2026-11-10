@@ -487,7 +487,8 @@ export const chatTools = {
         .union([z.string(), z.array(z.string())])
         .optional()
         .describe("Columns to show: units, netSales, inventoryOnHand, daysOfCover, returns. Default: units, netSales, inventoryOnHand, daysOfCover."),
-      sortBy: z.string().optional().describe("Column to sort by, highest first. Default: units. Use inventoryOnHand for stock questions."),
+      sortBy: z.string().optional().describe("Column to sort by. Default: units. Use inventoryOnHand for stock questions."),
+      sortDirection: z.enum(["desc", "asc"]).optional().describe("'desc' = highest first (default), 'asc' = lowest first, e.g. for 'running low on stock'."),
     }),
     execute: async (input, { messages }): Promise<ToolResult> => {
       const lines = loadOrderLines();
@@ -517,7 +518,15 @@ export const chatTools = {
         };
       });
       const sortKey = (TABLE_COLUMNS.find((c) => c.key === input.sortBy || c.label.toLowerCase() === input.sortBy?.toLowerCase())?.key ?? "units") as keyof (typeof rows)[number];
-      rows.sort((a, b) => Number(b[sortKey] ?? -1) - Number(a[sortKey] ?? -1) || a.product.localeCompare(b.product));
+      const dir = input.sortDirection === "asc" ? -1 : 1;
+      // Missing values (no stock record) always sort last.
+      const val = (r: (typeof rows)[number]) => (r[sortKey] === null || r[sortKey] === undefined ? null : Number(r[sortKey]));
+      rows.sort((a, b) => {
+        const x = val(a);
+        const y = val(b);
+        if (x === null || y === null) return x === y ? a.product.localeCompare(b.product) : x === null ? 1 : -1;
+        return dir * (y - x) || a.product.localeCompare(b.product);
+      });
 
       const additive = new Set(["units", "netSales", "inventoryOnHand", "returns"]);
       const chart: TableSpec = {

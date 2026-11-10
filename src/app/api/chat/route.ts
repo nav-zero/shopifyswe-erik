@@ -26,10 +26,12 @@ import {
   cannotAnswerText,
   chatTools,
   detectUnsupported,
+  runTool,
   systemPrompt,
   type ChatMessage,
 } from "@/lib/chat-tools";
 import { describeError } from "@/lib/errors";
+import { routeQuestion } from "@/lib/router";
 import { getModel } from "@/lib/openrouter";
 
 // Free models can be slow to start; give the stream room to finish.
@@ -46,8 +48,9 @@ export async function POST(req: Request) {
 
 async function answer(req: Request) {
   let messages: ChatMessage[];
+  let skipRules = false;
   try {
-    ({ messages } = await req.json());
+    ({ messages, skipRules = false } = await req.json());
     if (!Array.isArray(messages) || !messages.length) throw new Error();
   } catch {
     return Response.json({ error: "The request was malformed: the server expected a JSON body like { messages: [...] }." }, { status: 400 });
@@ -59,6 +62,12 @@ async function answer(req: Request) {
     return replyWithoutModel(cannotAnswer(question));
   }
 
+  // 2. Common question shapes → run the tool directly, no model call (see router.ts).
+  //    Saves the free model's 50-a-day allowance for questions the rules can't read.
+  // `skipRules` (used by `npm run check:guide -- --live`) sends the question to the model anyway.
+  const routed = skipRules ? null : routeQuestion(question, { hasHistory: messages.length > 1 });
+  if (routed) return replyWithTool(routed.tool, routed.input, question);
+
   // Locally this comes from .env.local; on Vercel, from the project's environment variables.
   const apiKey = process.env.OPENROUTER_API_KEY;
   if (!apiKey) {
@@ -69,7 +78,7 @@ async function answer(req: Request) {
   }
   const openrouter = createOpenRouter({ apiKey, fetch: failFastOnDailyLimit });
 
-  // 2. Everything else → the model picks a tool; the tool's visual is the answer.
+  // 3. Everything else → the model picks a tool; the tool's visual is the answer.
   const result = streamText({
     model: openrouter(getModel()),
     instructions: systemPrompt(),
@@ -107,6 +116,24 @@ function replyWithoutModel(result: ReturnType<typeof cannotAnswer>) {
       writer.write({ type: "text-delta", id, delta: cannotAnswerText(result) });
       writer.write({ type: "text-end", id });
       writer.write({ type: "data-suggestions", data: { questions: result.suggestions } });
+      writer.write({ type: "finish", finishReason: "stop" });
+    },
+  });
+  return createUIMessageStreamResponse({ stream });
+}
+
+/** Streams one tool result in the same format the model path uses, so the dashboard can't tell the difference. */
+function replyWithTool(tool: string, input: Record<string, unknown>, question: string) {
+  const stream = createUIMessageStream<ChatMessage>({
+    execute: async ({ writer }) => {
+      const toolCallId = `rule-${crypto.randomUUID()}`;
+      writer.write({ type: "start" });
+      writer.write({ type: "tool-input-available", toolCallId, toolName: tool, input });
+      try {
+        writer.write({ type: "tool-output-available", toolCallId, output: await runTool(tool, input, question) });
+      } catch (error) {
+        writer.write({ type: "tool-output-error", toolCallId, errorText: friendlyError(error) });
+      }
       writer.write({ type: "finish", finishReason: "stop" });
     },
   });

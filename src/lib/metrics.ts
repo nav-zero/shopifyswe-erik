@@ -1025,7 +1025,7 @@ function detectGroupBy(body: string): Dimension[] {
   return found.sort((a, b) => a.at - b.at).map((f) => f.dim);
 }
 
-function detectFilters(q: string, lines: OrderLine[]): Filters {
+export function detectFilters(q: string, lines: OrderLine[]): Filters {
   const filters: Filters = {};
   const push = (dim: Dimension, value: string) => {
     const list = (filters[dim] ??= []);
