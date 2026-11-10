@@ -20,7 +20,7 @@
  *   - Returns = refunds = line_total of fully refunded lines. Partial refunds
  *     have no amount in the data, so they are only counted.
  *   - Product = product_title, channel = sales_channel, country = shipping_country
- *   - Today = 21 September 2025
+ *   - Today = getToday() from metrics.ts: 21 September 2025 unless ANALYTICS_TODAY is set
  *
  * Comparisons: every range has a natural "previous period" (last week → the
  * week before, this month so far → the same days last month). Summaries always
@@ -30,15 +30,17 @@
 
 import { tool, type InferUITools, type ModelMessage, type UIMessage } from "ai";
 import { z } from "zod";
-import { chartTypeFor, type ChartSpec } from "./charts";
+import { chartTypeFor, type ChartSpec, type MetricSpec, type SeriesChartSpec, type TableSpec } from "./charts";
 import {
   addDays,
   formatMetric,
+  getToday,
+  inventoryLeft,
   loadOrderLines,
+  METRIC_DEFINITIONS,
   queryMetrics,
   resolveComparison,
   resolveDateRange,
-  TODAY,
   weekStart,
   type DateRange,
   type Dimension,
@@ -46,7 +48,7 @@ import {
   type Metric,
   type OrderLine,
 } from "./metrics";
-import { guideForPrompt } from "./question-guide";
+import { CANNOT_ANSWER_MESSAGE, DEFAULT_SUGGESTIONS, guideForPrompt, SUPPORTED_QUESTIONS } from "./question-guide";
 
 type Granularity = "day" | "week" | "month";
 
@@ -54,17 +56,8 @@ type Granularity = "day" | "week" | "month";
 // Questions we can't answer
 // ---------------------------------------------------------------------------
 
-export const CANNOT_ANSWER_MESSAGE = "Sorry, I can't answer that because I don't have the data.";
-
-/** Questions the tools below can answer. Suggestions are picked from these. */
-export const SUPPORTED_QUESTIONS = {
-  salesTrend: "How did sales trend over the last month?",
-  topProducts: "Which products brought in the most revenue last week?",
-  channelTrend: "How are sales by channel trending week by week?",
-  returnsTrend: "How have returns changed by product since August?",
-  productTrend: "How has the Summit Down Parka sold over time?",
-  countryTrend: "How do sales compare by country over the past 7 days?",
-} as const;
+// The message and suggestions live in question-guide.ts so the dashboard can use them too.
+export { CANNOT_ANSWER_MESSAGE, SUPPORTED_QUESTIONS };
 
 /**
  * Topics the CSV has no data for, each with the two closest questions we can
@@ -107,7 +100,7 @@ export interface CannotAnswerResult {
 }
 
 export function cannotAnswer(question = ""): CannotAnswerResult {
-  const suggestions = detectUnsupported(question) ?? [SUPPORTED_QUESTIONS.salesTrend, SUPPORTED_QUESTIONS.topProducts];
+  const suggestions = detectUnsupported(question) ?? DEFAULT_SUGGESTIONS;
   return { ok: false, unsupported: true, message: CANNOT_ANSWER_MESSAGE, suggestions };
 }
 
@@ -172,10 +165,12 @@ export interface ChartToolResult {
   comparedWith?: DateRange;
 }
 
+/** A question the tools couldn't answer, e.g. a product that doesn't exist. Shown like cannotAnswer, with the reason. */
 export interface ToolErrorResult {
   ok: false;
   unsupported?: false;
   error: string;
+  suggestions: string[];
 }
 
 type ToolResult = ChartToolResult | ToolErrorResult | CannotAnswerResult;
@@ -293,7 +288,7 @@ export const chatTools = {
 
       const series = [{ key: "s0", label: ctx.compare && prevBy ? "This period" : metric === "units" ? "Units sold" : "Net sales" }];
       if (ctx.compare && prevBy) series.push({ key: "s1", label: "Previous period" });
-      const chart: ChartSpec = {
+      const chart: SeriesChartSpec = {
         type: chartTypeFor("category"), // comparison → bar
         title,
         subtitle: ctx.range.label + (ctx.compare && prevBy ? ` vs ${ctx.previous!.range.label}` : ""),
@@ -434,6 +429,130 @@ export const chatTools = {
     toModelOutput: ({ output }) => toModelText(output),
   }),
 
+  totalMetrics: tool({
+    description:
+      "Single totals as metric cards, each compared with the previous period. Use for 'what was total net revenue last week', " +
+      "'how much did we make this month', 'how many units/orders did we sell', 'average order value', 'total refunds'.",
+    inputSchema: z.object({
+      ...timeInputs,
+      ...filterInputs,
+      metrics: z
+        .union([z.string(), z.array(z.string())])
+        .optional()
+        .describe("Which totals: netSales (default), grossSales, discounts, units, orders, customers, avgOrderValue, refunds."),
+    }),
+    execute: async (input, { messages }): Promise<ToolResult> => {
+      const lines = loadOrderLines();
+      const scope = resolveFilters(input, lines);
+      if (scope.error) return fail(scope.error);
+      const ctx = resolveTime(input, messages, lines);
+
+      const wanted = pickMetrics(input.metrics);
+      const current = queryMetrics({ metrics: wanted, filters: scope.filters, dateRange: ctx.range }, lines).totals;
+      const prev = ctx.previous ? queryMetrics({ metrics: wanted, filters: scope.filters, dateRange: ctx.previous.range }, lines).totals : null;
+      const chart: MetricSpec = {
+        type: "metric", // single totals → metric cards
+        title: wanted.length === 1 ? `Total ${METRIC_DEFINITIONS[wanted[0]].label.toLowerCase()}${scope.label ? ` — ${scope.label}` : ""}` : `Totals${scope.label ? ` — ${scope.label}` : ""}`,
+        subtitle: ctx.range.label,
+        metrics: wanted.map((m) => ({
+          key: m,
+          label: METRIC_DEFINITIONS[m].label,
+          value: current[m],
+          format: MONEY_METRICS.has(m) ? "currency" : "number",
+          ...(prev ? { previous: prev[m], change: prev[m] ? round4((current[m] - prev[m]) / prev[m]) : null, previousLabel: ctx.previous!.range.label } : {}),
+        })),
+      };
+      const fmtValue = (m: Metric, v: number) => (MONEY_METRICS.has(m) ? money(v) : formatMetric(m, v));
+      const summary = [
+        `${chart.title}, ${ctx.range.label}:`,
+        ...wanted.map((m) => `- ${METRIC_DEFINITIONS[m].label}: ${fmtValue(m, current[m])}${prev ? `, vs ${fmtValue(m, prev[m])} in ${ctx.previous!.range.label} (${change(current[m], prev[m])})` : ""}`),
+      ].join("\n");
+      const notes = [
+        ...(wanted.includes("refunds") ? ["Refunds are fully refunded items only; partial refund amounts aren't in the data."] : []),
+        ...(wanted.some((m) => m === "orders" || m === "avgOrderValue") ? ["Order counts are approximate: some order IDs repeat across customers in this export."] : []),
+      ];
+      return ok(chart, summary, ctx, notes);
+    },
+    toModelOutput: ({ output }) => toModelText(output),
+  }),
+
+  productTable: tool({
+    description:
+      "A table with one row per product and several numbers side by side: units sold, net sales, inventory on hand, days of stock left, returns. " +
+      "Use for 'units sold next to inventory on hand', 'stock levels by product', 'how much inventory is left', 'show a table of products'.",
+    inputSchema: z.object({
+      ...timeInputs,
+      ...filterInputs,
+      columns: z
+        .union([z.string(), z.array(z.string())])
+        .optional()
+        .describe("Columns to show: units, netSales, inventoryOnHand, daysOfCover, returns. Default: units, netSales, inventoryOnHand, daysOfCover."),
+      sortBy: z.string().optional().describe("Column to sort by, highest first. Default: units. Use inventoryOnHand for stock questions."),
+    }),
+    execute: async (input, { messages }): Promise<ToolResult> => {
+      const lines = loadOrderLines();
+      const scope = resolveFilters(input, lines);
+      if (scope.error) return fail(scope.error);
+      const ctx = resolveTime(input, messages, lines);
+
+      const columns = pickColumns(input.columns);
+      const sales = new Map(
+        queryMetrics({ metrics: ["units", "netSales", "refunds"], groupBy: ["product_title"], filters: scope.filters, dateRange: ctx.range }, lines).rows.map((r) => [r.label, r.values]),
+      );
+      // Inventory is the latest stock snapshot on or before the end of the range (see inventoryLeft in metrics.ts).
+      const stock = new Map(inventoryLeft(scope.filters, ctx.range.end, lines).map((r) => [r.productTitle, r]));
+      const products = distinct(lines.filter((l) => matchesScope(l, scope.filters)), (l) => l.productTitle);
+      const rows = products.map((title) => {
+        const v = sales.get(title);
+        const inv = stock.get(title);
+        return {
+          product: title,
+          sku: inv?.sku ?? lines.find((l) => l.productTitle === title)?.sku ?? "",
+          category: inv?.productCategory ?? lines.find((l) => l.productTitle === title)?.productCategory ?? "",
+          units: v?.units ?? 0,
+          netSales: v?.netSales ?? 0,
+          inventoryOnHand: inv?.inventoryOnHand ?? null,
+          daysOfCover: inv?.daysOfCover ?? null,
+          returns: v?.refunds ?? 0,
+        };
+      });
+      const sortKey = (TABLE_COLUMNS.find((c) => c.key === input.sortBy || c.label.toLowerCase() === input.sortBy?.toLowerCase())?.key ?? "units") as keyof (typeof rows)[number];
+      rows.sort((a, b) => Number(b[sortKey] ?? -1) - Number(a[sortKey] ?? -1) || a.product.localeCompare(b.product));
+
+      const additive = new Set(["units", "netSales", "inventoryOnHand", "returns"]);
+      const chart: TableSpec = {
+        type: "table", // several numbers per item → table
+        title: `Products${scope.label ? ` — ${scope.label}` : ""}`,
+        subtitle: `Sales ${ctx.range.label}; inventory as of ${longDate(ctx.range.end)}`,
+        columns: [
+          { key: "product", label: "Product", format: "text" },
+          { key: "category", label: "Category", format: "text" },
+          ...TABLE_COLUMNS.filter((c) => columns.includes(c.key)),
+        ],
+        rows,
+        totals: Object.fromEntries([
+          ["product", "Total"],
+          ["category", ""],
+          ...columns.map((c) => [c, additive.has(c) ? round2(rows.reduce((t, r) => t + Number(r[c as keyof (typeof rows)[number]] ?? 0), 0)) : null]),
+        ]),
+      };
+      const summary = [
+        `${chart.title}. ${chart.subtitle}.`,
+        ...rows.map(
+          (r) =>
+            `- ${r.product}: ${units(r.units)} sold, ${money(r.netSales)} net sales, ${r.inventoryOnHand ?? "unknown"} on hand` +
+            (r.daysOfCover !== null ? `, about ${r.daysOfCover} days of stock` : ""),
+        ),
+      ].join("\n");
+      const notes = [
+        "Inventory on hand is the stock level recorded on each product's most recent order, so it's an estimate.",
+        "Days of stock = inventory on hand ÷ average daily units sold over the 30 days before that date.",
+      ];
+      return ok(chart, summary, ctx, notes);
+    },
+    toModelOutput: ({ output }) => toModelText(output),
+  }),
+
   cannotAnswer: tool({
     description:
       "Use when the question needs data we don't have, such as ad spend, marketing, website traffic, conversion rate, costs, profit, margins, weather or reviews.",
@@ -445,25 +564,50 @@ export const chatTools = {
 
 export type ChatTools = typeof chatTools;
 export type ToolName = keyof ChatTools;
+export type { ToolResult };
+
+/**
+ * Runs one tool directly, without the model. The dashboard's Update button uses
+ * this to recompute saved charts for the current date (getToday()).
+ */
+export async function runTool(name: string, input: unknown, question: string): Promise<ToolResult> {
+  if (!Object.hasOwn(chatTools, name)) return fail(`Unknown tool "${name}".`);
+  const t = chatTools[name as ToolName] as unknown as {
+    inputSchema: { safeParse: (v: unknown) => { success: boolean; data?: unknown } };
+    execute: (input: unknown, options: unknown) => Promise<ToolResult>;
+  };
+  const parsed = t.inputSchema.safeParse(input);
+  if (!parsed.success) return fail("This chart's saved settings are no longer valid.");
+  return t.execute(parsed.data, { toolCallId: "refresh", messages: [{ role: "user", content: question }], context: {} });
+}
 
 /** The message type the UI should use with useChat, including tool and data parts. */
 export type ChatMessage = UIMessage<never, { suggestions: { questions: string[] } }, InferUITools<ChatTools>>;
 
-export const SYSTEM_PROMPT = `You are a sales analyst for an online clothing store. Today is Sunday 21 September 2025.
+/**
+ * The model's instructions. Built per request so "today" follows getToday().
+ * The model only picks a tool: the dashboard shows the tool's visual, never
+ * model-written text, so nothing it says can make up numbers.
+ */
+export function systemPrompt(): string {
+  const today = getToday();
+  const weekday = new Date(`${today}T00:00:00Z`).toLocaleDateString("en-GB", { weekday: "long", timeZone: "UTC" });
+  const coverage = dataCoverage(loadOrderLines());
+  return `You are a sales analyst for an online clothing store. Today is ${weekday} ${longDate(today)}.
 
-The data covers order line items from 1 June to 21 September 2025: products and categories (Tops, Outerwear, Knitwear, Accessories), SKUs, sales channels (Online Store, Shop, Point of Sale, Instagram), shipping countries (US, Canada, United Kingdom, Australia, Germany), net sales, units and returns.
+The data covers order line items from ${coverage.text}: products and categories (Tops, Outerwear, Knitwear, Accessories), SKUs, sales channels (Online Store, Shop, Point of Sale, Instagram), shipping countries (US, Canada, United Kingdom, Australia, Germany), net sales, units, returns and inventory on hand.
 "Sales" and "revenue" mean net sales (after discount).
 
-To answer, call exactly one tool. Pick it using the guide below.
+Always answer by calling a tool. Never answer in text. The user sees the tool's chart, table or metric cards.
+Pick the tool using the guide below. If a question asks for several different things, you may call more than one tool.
 Pass the user's time words unchanged as "period" (e.g. "last week", "Q3 so far"). Never calculate dates yourself.
 If the user compares with an earlier period ("vs the month before"), set compareWithPrevious to true.
+Earlier messages show what the dashboard already has; use them to understand follow-ups like "now by channel".
 
 ${guideForPrompt()}
 
-If the question needs data we don't have (ad spend, marketing, traffic, costs, profit, weather, reviews), call cannotAnswer.
-
-The user sees a chart from the tool automatically. After the tool returns, reply in one to three short sentences using only numbers from the tool result. Don't make up numbers.
-Write amounts as plain numbers without a currency symbol: the data doesn't say which currency it uses.`;
+If the question can't be answered from this data (ad spend, marketing, traffic, costs, profit, weather, reviews, or anything unrelated to the store's sales), call cannotAnswer.`;
+}
 
 // ---------------------------------------------------------------------------
 // Time ranges and comparisons
@@ -483,6 +627,8 @@ interface TimeContext extends PeriodContext {
   /** True when the user asked to compare periods: add the previous period to the chart. */
   compare: boolean;
   notes: string[];
+  /** Explains periods only partly in range; shown with line charts only. */
+  partialNote?: string;
 }
 
 /**
@@ -497,15 +643,15 @@ function resolveTime(
   lines: OrderLine[],
 ): TimeContext {
   const notes: string[] = [];
-  const dates = lines.map((l) => l.orderDate).sort();
-  const coverage = { start: dates[0], end: dates[dates.length - 1] < TODAY ? dates[dates.length - 1] : TODAY };
+  const today = getToday();
+  const coverage = dataCoverage(lines);
   const isIso = (s?: string) => !!s && /^\d{4}-\d{2}-\d{2}$/.test(s);
   const userText = lastUserText(messages);
 
   let range: DateRange | null = null;
   if (isIso(input.startDate) || isIso(input.endDate)) {
     const start = isIso(input.startDate) ? input.startDate! : coverage.start;
-    const end = isIso(input.endDate) ? input.endDate! : TODAY;
+    const end = isIso(input.endDate) ? input.endDate! : today;
     range = resolveDateRange(`${start} to ${end}`);
   } else if (input.period) {
     range = resolveDateRange(input.period);
@@ -516,25 +662,27 @@ function resolveTime(
   } else {
     range = resolveDateRange(userText);
   }
-  range ??= { start: coverage.start, end: coverage.end, label: "all data (1 Jun – 21 Sept 2025)" };
+  range ??= { start: coverage.start, end: coverage.end, label: `all data (${shortDate(coverage.start)} – ${longDate(coverage.end)})` };
 
   // Clip to the data we have, so charts don't show empty months before June.
   if (range.start < coverage.start || range.end > coverage.end) {
     const start = range.start < coverage.start ? coverage.start : range.start;
     const end = range.end > coverage.end ? coverage.end : range.end;
     if (start <= end) {
-      notes.push(`The data only covers 1 June to 21 September 2025, so this shows ${shortDate(start)} – ${shortDate(end)}.`);
-      range = { start, end, label: `${range.label.replace(/\s*\(.*\)$/, "")} (${shortDate(start)} – ${shortDate(end)} 2025)`, previous: range.previous };
-    } else notes.push("There is no data in this period: the data covers 1 June to 21 September 2025.");
+      notes.push(`The data only covers ${coverage.text}, so this shows ${shortDate(start)} – ${longDate(end)}.`);
+      range = { start, end, label: `${range.label.replace(/\s*\(.*\)$/, "")} (${shortDate(start)} – ${longDate(end)})`, previous: range.previous };
+    } else notes.push(`There is no data in this period: the data covers ${coverage.text}.`);
   }
 
   const days = Math.round((Date.parse(range.end) - Date.parse(range.start)) / 86_400_000) + 1;
   const gran: Granularity = input.granularity ?? (days <= 31 ? "day" : days <= 180 ? "week" : "month");
   const current = period(range, gran);
+  // Only relevant to line charts, so kept apart from the other notes (see ok()).
+  let partialNote: string | undefined;
   if (current.partial.size) {
-    notes.push(
+    partialNote = (
       `${[...current.partial].map((b) => bucketLabel(b, gran)).join(" and ")} ${current.partial.size === 1 ? "is" : "are"} only partly in this range, ` +
-        `so ${current.partial.size === 1 ? "it looks" : "they look"} lower. Partial periods are marked in the chart data and left out of highest/lowest.`,
+        `so ${current.partial.size === 1 ? "it looks" : "they look"} lower. Partial periods are marked in the chart data and left out of highest/lowest.`
     );
   }
 
@@ -545,9 +693,9 @@ function resolveTime(
   let previous: PeriodContext | null = null;
   if (prevRange) {
     if (prevRange.start >= coverage.start && prevRange.end <= coverage.end) previous = period(prevRange, gran);
-    else if (asked) notes.push(`Can't compare with ${prevRange.label}: the data starts on 1 June 2025.`);
+    else if (asked) notes.push(`Can't compare with ${prevRange.label}: the data covers ${coverage.text}.`);
   }
-  return { ...current, previous, compare: asked && !!previous, notes };
+  return { ...current, previous, compare: asked && !!previous, notes, partialNote };
 }
 
 function period(range: DateRange, granularity: Granularity): PeriodContext {
@@ -593,7 +741,7 @@ function bucketRow(b: string, p: PeriodContext): Record<string, string | number>
 }
 
 /** Points for highest/lowest and trends: full periods only, unless every period is partial. */
-function comparablePoints(rows: ChartSpec["data"], key: string) {
+function comparablePoints(rows: SeriesChartSpec["data"], key: string) {
   const pts = rows.map((r) => ({ label: String(r.label), value: Number(r[key]), partial: r.partial === 1 }));
   const full = pts.filter((p) => !p.partial);
   return full.length ? full : pts;
@@ -719,7 +867,7 @@ function seriesLines(b: Breakdown, ctx: TimeContext, fmtValue: (v: number) => st
 }
 
 /** Totals of the first and second half of the full periods in a series, for trends when there's no earlier data. */
-function halves(rows: ChartSpec["data"], key: string): { first: number; second: number } | null {
+function halves(rows: SeriesChartSpec["data"], key: string): { first: number; second: number } | null {
   const pts = comparablePoints(rows, key);
   if (pts.length < 4) return null;
   const mid = Math.floor(pts.length / 2);
@@ -728,13 +876,13 @@ function halves(rows: ChartSpec["data"], key: string): { first: number; second: 
   return { first, second };
 }
 
-function trendWithin(rows: ChartSpec["data"], key: string, ctx: TimeContext, fmtValue: (v: number) => string): string {
+function trendWithin(rows: SeriesChartSpec["data"], key: string, ctx: TimeContext, fmtValue: (v: number) => string): string {
   const t = halves(rows, key);
   if (!t) return "";
   return `No earlier data to compare with, so within the period: the second half (${fmtValue(t.second)}) vs the first half (${fmtValue(t.first)}) is ${change(t.second, t.first)} (${ctx.granularity}s compared like for like).`;
 }
 
-function timeChart(title: string, ctx: TimeContext, metric: Metric, series: ChartSpec["series"], data: ChartSpec["data"]): ChartSpec {
+function timeChart(title: string, ctx: TimeContext, metric: Metric, series: SeriesChartSpec["series"], data: SeriesChartSpec["data"]): SeriesChartSpec {
   const isMoney = metric === "netSales" || metric === "grossSales" || metric === "refunds" || metric === "discounts";
   return {
     type: chartTypeFor("time"), // over time → line
@@ -883,23 +1031,76 @@ function lastUserText(messages: ModelMessage[]): string {
 // Small helpers
 // ---------------------------------------------------------------------------
 
+const MONEY_METRICS: ReadonlySet<Metric> = new Set(["netSales", "grossSales", "discounts", "refunds", "avgOrderValue"]);
+
+/** Maps what the model asked for ("revenue", "AOV", "units") to metric keys. Unknown words are ignored. */
+function pickMetrics(input: string | string[] | undefined): Metric[] {
+  const aliases: Record<string, Metric> = {
+    netsales: "netSales", "net sales": "netSales", sales: "netSales", revenue: "netSales", "net revenue": "netSales", "total revenue": "netSales",
+    grosssales: "grossSales", "gross sales": "grossSales", gross: "grossSales", "gross revenue": "grossSales",
+    discounts: "discounts", discount: "discounts", units: "units", "units sold": "units", items: "units", quantity: "units",
+    orders: "orders", "order count": "orders", customers: "customers", avgordervalue: "avgOrderValue", aov: "avgOrderValue",
+    "average order value": "avgOrderValue", refunds: "refunds", returns: "refunds",
+  };
+  const picked = toList(input)
+    .map((w) => aliases[w.trim().toLowerCase()] ?? aliases[w.trim().toLowerCase().replace(/[^a-z ]/g, "")])
+    .filter((m): m is Metric => !!m);
+  return picked.length ? [...new Set(picked)] : ["netSales"];
+}
+
+const TABLE_COLUMNS = [
+  { key: "units", label: "Units sold", format: "number" },
+  { key: "netSales", label: "Net sales", format: "currency" },
+  { key: "inventoryOnHand", label: "Inventory on hand", format: "number" },
+  { key: "daysOfCover", label: "Days of stock", format: "number" },
+  { key: "returns", label: "Returns", format: "currency" },
+] as const satisfies readonly TableSpec["columns"][number][];
+
+function pickColumns(input: string | string[] | undefined): string[] {
+  const aliases: Record<string, string> = {
+    units: "units", "units sold": "units", sold: "units", netsales: "netSales", "net sales": "netSales", sales: "netSales", revenue: "netSales",
+    inventory: "inventoryOnHand", inventoryonhand: "inventoryOnHand", "inventory on hand": "inventoryOnHand", stock: "inventoryOnHand", "on hand": "inventoryOnHand",
+    daysofcover: "daysOfCover", "days of cover": "daysOfCover", "days of stock": "daysOfCover", returns: "returns", refunds: "returns",
+  };
+  const picked = toList(input).map((w) => aliases[w.trim().toLowerCase()]).filter(Boolean);
+  return picked.length ? TABLE_COLUMNS.map((c) => c.key).filter((k) => picked.includes(k)) : ["units", "netSales", "inventoryOnHand", "daysOfCover"];
+}
+
+/** Whether a line passes the scope's filters (used to list every product in scope, even ones with no sales). */
+function matchesScope(l: OrderLine, f: Filters): boolean {
+  const ok = (values: string[] | undefined, v: string) => !values || values.includes(v);
+  return ok(f.sales_channel, l.salesChannel) && ok(f.shipping_country, l.shippingCountry) && ok(f.product_category, l.productCategory) && ok(f.product_title, l.productTitle);
+}
+
+/** The dates the CSV covers, ending no later than today. */
+function dataCoverage(lines: OrderLine[]) {
+  const today = getToday();
+  const dates = lines.map((l) => l.orderDate).sort();
+  const start = dates[0];
+  const end = dates[dates.length - 1] < today ? dates[dates.length - 1] : today;
+  return { start, end, text: `${longDate(start)} to ${longDate(end)}` };
+}
+
+const longDate = (iso: string) =>
+  new Date(`${iso}T00:00:00Z`).toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric", timeZone: "UTC" });
 const shortDate = (iso: string) => new Date(`${iso}T00:00:00Z`).toLocaleDateString("en-GB", { day: "numeric", month: "short", timeZone: "UTC" });
 const distinct = (lines: OrderLine[], get: (l: OrderLine) => string) => [...new Set(lines.map(get))].sort();
 const ok = (chart: ChartSpec, summary: string, ctx: TimeContext, notes: string[] = []): ChartToolResult => ({
   ok: true,
   chart,
   summary,
-  notes: [...ctx.notes, ...notes],
+  notes: [...ctx.notes, ...(chart.type === "line" && ctx.partialNote ? [ctx.partialNote] : []), ...notes],
   dateRange: ctx.range,
   comparedWith: ctx.previous?.range,
 });
-const fail = (error: string): ToolErrorResult => ({ ok: false, error });
+const fail = (error: string): ToolErrorResult => ({ ok: false, error, suggestions: DEFAULT_SUGGESTIONS });
 const money = (v: number) => formatMetric("netSales", v);
 const units = (v: number) => `${formatMetric("units", v)} ${v === 1 ? "unit" : "units"}`;
 const pct = (share?: number) => `${((share ?? 0) * 100).toFixed(1)}%`;
 const signedPct = (p: number) => `${p >= 0 ? "+" : ""}${(p * 100).toFixed(1)}%`;
 const plural = (word: string, n: number) => (n === 1 ? word : `${word}s`);
 const round2 = (n: number) => Math.round(n * 100) / 100;
+const round4 = (n: number) => Math.round(n * 10000) / 10000;
 const sum = (values: Iterable<number>) => round2([...values].reduce((a, b) => a + b, 0));
 const maxBy = (pts: { label: string; value: number }[]) => (pts.length ? pts.reduce((a, b) => (b.value > a.value ? b : a)) : undefined);
 const minBy = (pts: { label: string; value: number }[]) => (pts.length ? pts.reduce((a, b) => (b.value < a.value ? b : a)) : undefined);

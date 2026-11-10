@@ -146,8 +146,18 @@ function parseCsv(text: string): string[][] {
 // ---------------------------------------------------------------------------
 
 // We assume today is 21 September 2025: it is the last day in the dataset, so
-// "today", "last week" etc. are always relative to this date, never the real clock.
-export const TODAY = "2025-09-21";
+// "today", "last week" etc. are relative to this date, not the real clock.
+// To make dates dynamic later, set ANALYTICS_TODAY: "today" uses the server's
+// current date (UTC), or give a fixed YYYY-MM-DD. The dashboard's Update button
+// re-runs every chart with whatever getToday() returns at that moment.
+export const DEFAULT_TODAY = "2025-09-21";
+
+export function getToday(): string {
+  const setting = process.env.ANALYTICS_TODAY?.trim();
+  if (setting === "today") return new Date().toISOString().slice(0, 10);
+  if (setting && /^\d{4}-\d{2}-\d{2}$/.test(setting)) return setting;
+  return DEFAULT_TODAY;
+}
 
 /** Inclusive on both ends: start and end days are both part of the range. */
 export interface DateRange {
@@ -198,7 +208,7 @@ type Season = keyof typeof SEASON_START_MONTH;
  *
  * For "X vs Y" questions, X is the period returned here; see resolveComparison() for Y.
  */
-export function resolveDateRange(text: string, today: string = TODAY): DateRange | null {
+export function resolveDateRange(text: string, today: string = getToday()): DateRange | null {
   // "last month compared to the month before": the period asked about comes
   // first. If that part has no dates ("compare Canada vs the US this season"),
   // read the whole text.
@@ -321,7 +331,7 @@ function resolveSingle(text: string, today: string): DateRange | null {
  * that") means the main period's natural `previous`. Named periods ("vs July",
  * "vs Q2", "vs summer") are resolved on their own.
  */
-export function resolveComparison(text: string, main: DateRange | null = resolveDateRange(text), today: string = TODAY): DateRange | null {
+export function resolveComparison(text: string, main: DateRange | null = resolveDateRange(text), today: string = getToday()): DateRange | null {
   const { other } = splitComparison(text);
   if (!other || !main) return null;
   const o = other.trim().toLowerCase();
@@ -753,7 +763,7 @@ function dataNotes(matched: OrderLine[], metrics: Metric[], dateRange: DateRange
     notes.push(`No line items match. The data covers ${fmt(dates[0])} – ${fmt(dates[dates.length - 1])}.`);
     return notes;
   }
-  if (dateRange) notes.push(`Dates are inclusive: ${fmt(dateRange.start)} to ${fmt(dateRange.end)}, with today taken as ${fmt(TODAY)}.`);
+  if (dateRange) notes.push(`Dates are inclusive: ${fmt(dateRange.start)} to ${fmt(dateRange.end)}, with today taken as ${fmt(getToday())}.`);
   if (metrics.some((m) => m === "refunds" || m === "refundedUnits" || m === "partiallyRefundedLineItems")) {
     notes.push("Refunds only cover fully refunded line items (their whole line_total).");
     const partial = matched.filter((l) => l.financialStatus === "partially_refunded");
@@ -799,7 +809,7 @@ export interface InventoryRow {
  */
 export function inventoryLeft(
   filters: Filters = {},
-  asOf: string = TODAY,
+  asOf: string = getToday(),
   lines: OrderLine[] = loadOrderLines(),
 ): InventoryRow[] {
   const relevant = filterLines(lines, filters).filter((l) => l.orderDate <= asOf);
@@ -845,7 +855,7 @@ export function describeDataset(lines: OrderLine[] = loadOrderLines()) {
   const distinct = (dim: Dimension) => [...new Set(lines.map(DIMENSIONS[dim]))].sort();
   const dates = distinct("day");
   return {
-    today: TODAY,
+    today: getToday(),
     coverage: { start: dates[0], end: dates[dates.length - 1] },
     lineItems: lines.length,
     grain: "One row per line item (a product within an order).",
@@ -929,7 +939,7 @@ export function interpretQuestion(question: string, lines: OrderLine[] = loadOrd
   const { sortDirection, limit } = detectRanking(body);
 
   if (/\b(inventory|stock|on hand|stock levels?)\b/.test(body)) {
-    return { kind: "inventory", filters, asOf: dateRange?.end ?? TODAY, sortDirection: sortDirection ?? "asc", limit };
+    return { kind: "inventory", filters, asOf: dateRange?.end ?? getToday(), sortDirection: sortDirection ?? "asc", limit };
   }
 
   const metrics = detectMetrics(body);

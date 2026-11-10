@@ -15,11 +15,37 @@
  *   npm run check:guide          (inputs and tool results, no model)
  *   npm run check:guide -- --live (also asks the running dev server's model)
  *
- * Chart rule (set in code, see charts.ts): anything over time is a line chart,
- * comparing things side by side (products, SKUs) is a bar chart.
+ * Visual rule (set in code, see charts.ts): anything over time is a line chart,
+ * comparing things side by side (products, SKUs) is a bar chart, several
+ * numbers per item in a category is a table, and single totals are metric cards.
  */
 
 import type { ToolName } from "./chat-tools";
+
+/** Shown when a question can't be answered from the data. */
+export const CANNOT_ANSWER_MESSAGE = "Sorry, I can't answer that because I don't have the data.";
+
+/** Questions the tools can answer. "Can't answer" replies suggest two of these. */
+export const SUPPORTED_QUESTIONS = {
+  salesTrend: "How did sales trend over the last month?",
+  topProducts: "Which products brought in the most revenue last week?",
+  channelTrend: "How are sales by channel trending week by week?",
+  returnsTrend: "How have returns changed by product since August?",
+  productTrend: "How has the Summit Down Parka sold over time?",
+  countryTrend: "How do sales compare by country over the past 7 days?",
+} as const;
+
+export const DEFAULT_SUGGESTIONS: string[] = [SUPPORTED_QUESTIONS.salesTrend, SUPPORTED_QUESTIONS.topProducts];
+
+/** Starter questions on an empty dashboard, one per kind of visual. */
+export const STARTER_QUESTIONS = [
+  "What was total net revenue last week?",
+  "How did sales trend last month compared to the month before?",
+  "Top 5 products this week by revenue",
+  "Show units sold next to inventory on hand for each product",
+  "Revenue by country for the past 7 days",
+  "Which winter jackets got returned a lot last week?",
+];
 
 export interface GuideExample {
   question: string;
@@ -34,7 +60,7 @@ export interface GuideCategory {
   name: string;
   /** What this kind of question is about, for the model and for developers. */
   about: string;
-  chart: "line" | "bar" | "line or bar";
+  chart: "line" | "bar" | "line or bar" | "table" | "metric";
   examples: GuideExample[];
 }
 
@@ -183,6 +209,47 @@ export const QUESTION_GUIDE: GuideCategory[] = [
         tool: "productSalesOverTime",
         input: { period: "this month", products: ["tee"], compareWithPrevious: true },
         note: "This month so far (1–21 Sep) is compared with the same days of August. The catalogue has one tee.",
+      },
+    ],
+  },
+  {
+    name: "Totals",
+    about: "A single number or a few headline numbers for a period, compared with the previous period, shown as metric cards.",
+    chart: "metric",
+    examples: [
+      {
+        question: "what was total net revenue last week",
+        tool: "totalMetrics",
+        input: { period: "last week" },
+      },
+      {
+        question: "how many units did we sell this month and what's our average order value",
+        tool: "totalMetrics",
+        input: { period: "this month", metrics: ["units", "avgOrderValue"] },
+      },
+      {
+        question: "total refunds on instagram in Q3 so far",
+        tool: "totalMetrics",
+        input: { period: "Q3 so far", channels: ["Instagram"], metrics: ["refunds"] },
+        note: "Full refunds only; partial refund amounts aren't in the data.",
+      },
+    ],
+  },
+  {
+    name: "Product tables",
+    about: "Several numbers side by side for each product in a category, such as units sold next to inventory on hand, shown as a table.",
+    chart: "table",
+    examples: [
+      {
+        question: "show units sold next to inventory on hand for each product",
+        tool: "productTable",
+        input: {},
+        note: "Inventory is the stock level on each product's most recent order, so it's an estimate.",
+      },
+      {
+        question: "how much outerwear stock is left compared to what sold in the last 30 days",
+        tool: "productTable",
+        input: { period: "last 30 days", category: "Outerwear", sortBy: "inventoryOnHand" },
       },
     ],
   },

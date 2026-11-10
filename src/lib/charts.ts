@@ -1,23 +1,27 @@
 /**
- * charts.ts — the chart description every chat tool returns.
+ * charts.ts — the visual every chat tool returns.
  *
- * Tools don't draw anything. They return a `ChartSpec`: plain JSON saying what
- * kind of chart to draw and with what data. Any charting library (Recharts,
- * Chart.js, Vega, …) can render it, and nothing here imports a library.
+ * Tools don't draw anything. They return a `ChartSpec`: plain JSON saying which
+ * visual to show and with what data. The dashboard (src/components) renders it;
+ * any other charting library could too, since nothing here imports one.
+ *
+ * Which visual, kept in one place:
+ *   - line   → anything over time (x-axis is dates)
+ *   - bar    → comparing things side by side in one period (products, SKUs)
+ *   - table  → several numbers per item in a category (units sold next to inventory)
+ *   - metric → single totals (total net revenue), shown as cards
  *
  * This file has no server-only imports, so the UI can import these types too.
  */
 
-/**
- * The rule for picking a chart type, kept in one place:
- *   - anything over time (x-axis is dates) → line chart
- *   - comparing things side by side (x-axis is categories, e.g. products) → bar chart
- */
-export type ChartType = "line" | "bar";
+export type ChartType = "line" | "bar" | "table" | "metric";
 
-export function chartTypeFor(xType: ChartSpec["xType"]): ChartType {
+/** Over time → line; side-by-side comparison → bar. */
+export function chartTypeFor(xType: SeriesChartSpec["xType"]): "line" | "bar" {
   return xType === "time" ? "line" : "bar";
 }
+
+export type ValueFormat = "currency" | "number" | "percent" | "text";
 
 export interface ChartSeries {
   /** Field name in each data row holding this series' value. Safe keys like "s0" so any library can use them. */
@@ -26,11 +30,15 @@ export interface ChartSeries {
   label: string;
 }
 
-export interface ChartSpec {
-  type: ChartType;
+interface BaseSpec {
   title: string;
   /** One line of context, e.g. the date range. */
   subtitle?: string;
+}
+
+/** Line and bar charts. */
+export interface SeriesChartSpec extends BaseSpec {
+  type: "line" | "bar";
   /** "time": x values are ISO dates in order. "category": x values are names (products, channels). */
   xType: "time" | "category";
   /** Field in each data row with the raw x value (ISO date or category name). */
@@ -52,3 +60,39 @@ export interface ChartSpec {
    */
   data: Array<Record<string, string | number>>;
 }
+
+export interface TableColumn {
+  key: string;
+  label: string;
+  format: ValueFormat;
+}
+
+/** A table: one row per item (e.g. product), one column per number. */
+export interface TableSpec extends BaseSpec {
+  type: "table";
+  columns: TableColumn[];
+  /** Cells are keyed by column key. null = no value (shown as a dash). */
+  rows: Array<Record<string, string | number | null>>;
+  /** Optional totals row, keyed like the other rows. */
+  totals?: Record<string, string | number | null>;
+}
+
+export interface MetricValue {
+  key: string;
+  label: string;
+  value: number;
+  format: "currency" | "number";
+  /** Same metric in the previous period, when the data covers it. */
+  previous?: number;
+  /** (value − previous) ÷ previous; null when previous is 0. */
+  change?: number | null;
+  previousLabel?: string;
+}
+
+/** Metric cards: one card per single total. */
+export interface MetricSpec extends BaseSpec {
+  type: "metric";
+  metrics: MetricValue[];
+}
+
+export type ChartSpec = SeriesChartSpec | TableSpec | MetricSpec;

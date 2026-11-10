@@ -1,26 +1,58 @@
 @import "tailwindcss";
 
-:root {
-  --background: #ffffff;
-  --foreground: #171717;
-}
-
+/* Merchant Analytics: a light, Shopify-admin-like palette. */
 @theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
+  --font-sans: var(--font-inter), ui-sans-serif, system-ui, sans-serif;
+  --color-canvas: #f6f6f7;
+  --color-subtle: #f1f2f4;
+  --color-line: #e1e3e5;
+  --color-ink: #202223;
+  --color-muted: #6d7175;
+  --color-accent: #008060;
+  --color-accent-hover: #006e52;
+  --shadow-card: 0 1px 2px rgba(23, 24, 24, 0.06), 0 0 0 1px rgba(23, 24, 24, 0.02);
 }
 
 body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  background: var(--color-canvas);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+}
+
+@layer components {
+  .btn-primary {
+    @apply inline-flex shrink-0 items-center gap-1.5 rounded-lg bg-accent px-3.5 py-2 text-[13px] font-semibold text-white shadow-sm transition hover:bg-accent-hover focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent disabled:cursor-not-allowed disabled:opacity-45;
+  }
+  .btn-secondary {
+    @apply inline-flex items-center gap-1.5 rounded-lg border border-line bg-white px-3 py-2 text-[13px] font-medium text-ink transition hover:bg-subtle focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent;
+  }
+  .chip {
+    @apply rounded-full border border-line bg-white px-3 py-1.5 text-left text-[13px] text-ink transition hover:border-accent/50 hover:bg-[#f1f8f5] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent;
+  }
+  .spinner {
+    @apply inline-block h-4 w-4 animate-spin rounded-full border-2 border-accent/25 border-t-accent;
+  }
+  .skeleton {
+    background: linear-gradient(90deg, #eceef0 0%, #f6f7f8 50%, #eceef0 100%);
+    background-size: 200% 100%;
+    animation: shimmer 1.4s ease-in-out infinite;
+  }
+  .animate-fade-in {
+    animation: fade-in 0.35s ease-out;
+  }
+}
+
+@keyframes shimmer {
+  from { background-position: 200% 0; }
+  to { background-position: -200% 0; }
+}
+
+@keyframes fade-in {
+  /* Starts partly visible so the text stays readable if the browser pauses animations (background tabs). */
+  from { opacity: 0.4; transform: translateY(3px); }
+  to { opacity: 1; transform: none; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .skeleton, .animate-fade-in, .spinner { animation: none; }
 }
