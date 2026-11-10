@@ -19,6 +19,28 @@ Questions can build on each other: each new one adds a chart to the current dash
 
 The data is the merchant order history in [`data/`](data/): 3,000 order line items from 1 June to 21 September 2025.
 
+## What the answers look like
+
+Every answer is one of four visuals, chosen by the kind of question.
+
+**Line chart**: anything over time. Comparing with an earlier period adds it as a dashed line.
+
+![Line chart: net sales over the last month, with the month before as a dashed line](docs/screenshots/line-chart.png)
+
+**Bar chart**: comparing products or SKUs side by side in one period.
+
+![Bar chart: top 5 products this week by net sales](docs/screenshots/bar-chart.png)
+
+**Metric cards**: single totals, each with its change from the previous period.
+
+![Metric cards: net sales, orders and average order value this month, each compared with the same days last month](docs/screenshots/metric-cards.png)
+
+**Table**: several numbers for each item in a category.
+
+![Table: units sold, net sales, inventory on hand and days of stock for each product](docs/screenshots/table.png)
+
+To refresh these after UI changes, run `npm run dev`, then `npm run screenshots` in a second terminal.
+
 ## Limits of this prototype
 
 - **Fixed data set.** Every answer comes from one CSV export of orders from 1 June to 21 September 2025. It isn't connected to a live store, so new orders don't appear.
@@ -102,6 +124,7 @@ Then add your OpenRouter key to `.env.local`:
 | `npm run lint` | Lint the code. |
 | `npm run check:guide` | Check every example in the question guide: its inputs are valid, its tool runs on the data, it returns the right kind of visual, and the rules pick the same tool (or leave it to the model). Vague examples must ask the expected clarifying question and, once answered, reach the expected chart. Also checks every question the dashboard suggests is answered by the rules. No model calls. |
 | `npm run check:guide -- --live` | Also ask the model, through the running app, about the examples the rules leave to it. |
+| `npm run screenshots` | Capture the README screenshots from the running app into `docs/screenshots/`, using your installed Google Chrome. No model calls. |
 | `npm run check:guide -- --live-all` | Ask the model about every example, skipping the rules. Uses about 23 of the 50 free daily requests. |
 
 ## Deploying

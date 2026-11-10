@@ -182,7 +182,8 @@ function pickMetrics(q: string): string[] {
   if (/\bdiscounts?\b/i.test(q) && !/before discount/i.test(q)) picked.push("discounts");
   if (/\b(net )?(revenue|sales)\b|\bhow much (did we|have we|money)\b/i.test(q) && !picked.includes("grossSales")) picked.push("netSales");
   if (/\bunits?\b|how many (items|products)\b/i.test(q)) picked.push("units");
-  if (/\borders?\b/i.test(q) && !/average order/i.test(q)) picked.push("orders");
+  // "orders" on its own, not the "order" in "average order value".
+  if (/\borders?\b/i.test(q.replace(/average order( value| size)?/gi, " "))) picked.push("orders");
   if (/\bcustomers?\b/i.test(q)) picked.push("customers");
   if (/\baverage order value\b|\baov\b|average order/i.test(q)) picked.push("avgOrderValue");
   return picked.length ? picked : ["netSales"];
