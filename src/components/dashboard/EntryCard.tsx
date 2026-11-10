@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { CANNOT_ANSWER_MESSAGE, DEFAULT_SUGGESTIONS } from "@/lib/question-guide";
-import type { Entry, ToolResult } from "@/lib/dashboard-client";
+import type { Clarification, Entry, ToolResult } from "@/lib/dashboard-client";
 import { Visual } from "./Visual";
 
 /** Shown one at a time, in order, while a question is being answered. */
@@ -16,16 +16,20 @@ export function EntryCard({
   entry,
   onAsk,
   onRetry,
+  onClarify,
   onRemove,
 }: {
   entry: Entry;
   onAsk: (question: string) => void;
   onRetry: () => void;
+  /** Re-asks this entry with the clarified question. */
+  onClarify: (question: string) => void;
   onRemove: () => void;
 }) {
   const visuals = entry.results.filter((r) => r.output?.ok);
   const cannot = entry.results.find((r) => r.output && !r.output.ok);
-  const nothing = entry.status === "done" && !visuals.length;
+  const clarifying = entry.status === "done" && !!entry.clarify;
+  const nothing = entry.status === "done" && !visuals.length && !clarifying;
 
   return (
     <section className="group/entry" aria-label={entry.question}>
@@ -44,6 +48,16 @@ export function EntryCard({
           </button>
         )}
       </div>
+      {!!entry.corrections?.length && (
+        <p className="-mt-1 mb-2 px-1 text-[12px] text-muted">
+          Read {entry.corrections.map((c, i) => (
+            <span key={i}>
+              {i > 0 && ", "}“{c.from}” as <span className="font-medium text-ink/70">“{c.to}”</span>
+            </span>
+          ))}
+          .
+        </p>
+      )}
 
       <div className="grid gap-4 xl:grid-cols-2">
         {visuals.map((r) => (
@@ -65,6 +79,12 @@ export function EntryCard({
                 Try again
               </button>
             </Problem>
+          </Card>
+        )}
+
+        {clarifying && (
+          <Card wide>
+            <ClarifyCard clarification={entry.clarify!} onAnswer={onClarify} />
           </Card>
         )}
 
@@ -109,6 +129,60 @@ export function Loader() {
         {[38, 62, 48, 80, 56, 92, 70, 84, 60, 74].map((h, n) => (
           <div key={n} className="skeleton flex-1 rounded-t" style={{ height: `${h}%`, animationDelay: `${n * 80}ms` }} />
         ))}
+      </div>
+    </div>
+  );
+}
+
+/**
+ * A clarifying question: pick an option, or for dates choose exact from/to
+ * dates. Either way the question is re-asked with the answer filled in.
+ */
+function ClarifyCard({ clarification: c, onAnswer }: { clarification: Clarification; onAnswer: (question: string) => void }) {
+  const [from, setFrom] = useState(c.minDate ?? "");
+  const [to, setTo] = useState(c.maxDate ?? "");
+  const validRange = !!from && !!to && from <= to;
+  return (
+    <div className="flex gap-3">
+      <div aria-hidden className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-[#EAF4FF] text-[#006FBB]">
+        <svg viewBox="0 0 20 20" className="h-4 w-4" fill="currentColor">
+          <path d="M10 2a8 8 0 1 0 0 16 8 8 0 0 0 0-16Zm-.1 11.6a1 1 0 1 1 0 2 1 1 0 0 1 0-2ZM10 4.75c1.73 0 3.1 1.2 3.1 2.8 0 1.2-.7 1.9-1.45 2.4-.6.4-.9.7-.9 1.3v.25a.75.75 0 0 1-1.5 0v-.25c0-1.3.75-1.95 1.5-2.45.55-.37.85-.67.85-1.25 0-.7-.65-1.3-1.6-1.3-.85 0-1.45.45-1.65 1.15a.75.75 0 1 1-1.44-.42C7.27 5.6 8.5 4.75 10 4.75Z" />
+        </svg>
+      </div>
+      <div className="flex min-w-0 flex-col gap-3">
+        <div>
+          <p className="text-[15px] font-semibold text-ink">{c.prompt}</p>
+          {c.detail && <p className="mt-1 text-[13px] text-muted">{c.detail}</p>}
+        </div>
+        <div className="flex flex-wrap gap-2">
+          {c.options.map((o) => (
+            <button key={o.question} type="button" onClick={() => onAnswer(o.question)} className="chip">
+              {o.label}
+            </button>
+          ))}
+        </div>
+        {c.kind === "date" && c.template && (
+          <form
+            className="flex flex-wrap items-end gap-2"
+            onSubmit={(e) => {
+              e.preventDefault();
+              if (validRange) onAnswer(c.template!.replace("{range}", `from ${from} to ${to}`));
+            }}
+          >
+            <label className="flex flex-col gap-1 text-[12px] text-muted">
+              From
+              <input type="date" value={from} min={c.minDate} max={c.maxDate} onChange={(e) => setFrom(e.target.value)} className="date-input" />
+            </label>
+            <label className="flex flex-col gap-1 text-[12px] text-muted">
+              To
+              <input type="date" value={to} min={c.minDate} max={c.maxDate} onChange={(e) => setTo(e.target.value)} className="date-input" />
+            </label>
+            <button type="submit" disabled={!validRange} className="btn-secondary">
+              Use these dates
+            </button>
+            {!validRange && from && to && <span className="text-[12px] text-[#BF0711]">The start date must be on or before the end date.</span>}
+          </form>
+        )}
       </div>
     </div>
   );

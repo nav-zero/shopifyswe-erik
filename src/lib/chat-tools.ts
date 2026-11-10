@@ -48,6 +48,8 @@ import {
   type Metric,
   type OrderLine,
 } from "./metrics";
+import type { Clarification } from "./clarify";
+import { editDistance, type Correction } from "./fuzzy";
 import { CANNOT_ANSWER_MESSAGE, DEFAULT_SUGGESTIONS, guideForPrompt, SUPPORTED_QUESTIONS } from "./question-guide";
 
 type Granularity = "day" | "week" | "month";
@@ -591,7 +593,18 @@ export async function runTool(name: string, input: unknown, question: string): P
 }
 
 /** The message type the UI should use with useChat, including tool and data parts. */
-export type ChatMessage = UIMessage<never, { suggestions: { questions: string[] } }, InferUITools<ChatTools>>;
+export type ChatMessage = UIMessage<
+  never,
+  {
+    /** Two questions we can answer, sent with the "no data" reply. */
+    suggestions: { questions: string[] };
+    /** A clarifying question (vague dates, unknown product) instead of a chart. */
+    clarify: Clarification;
+    /** Typos fixed before answering, e.g. "jakets" → "jackets". */
+    corrected: { corrections: Correction[] };
+  },
+  InferUITools<ChatTools>
+>;
 
 /**
  * The model's instructions. Built per request so "today" follows getToday().
@@ -696,9 +709,11 @@ function resolveTime(
   }
 
   // The comparison period: a named one ("July vs August"), else the natural previous period.
+  // From the model's comparePeriod, or from the question itself ("… compared to 2025-07-01 to 2025-07-31").
+  const fromText = resolveComparison(userText, range) ?? (input.period ? resolveComparison(input.period, range) : null);
   const named = input.comparePeriod ? resolveComparison(`x vs ${input.comparePeriod}`, range) : null;
-  const asked = !!input.compareWithPrevious || !!named || !!resolveComparison(userText, range) || !!(input.period && resolveComparison(input.period, range));
-  const prevRange = named ?? range.previous ?? null;
+  const asked = !!input.compareWithPrevious || !!named || !!fromText;
+  const prevRange = named ?? fromText ?? range.previous ?? null;
   let previous: PeriodContext | null = null;
   if (prevRange) {
     if (prevRange.start >= coverage.start && prevRange.end <= coverage.end) previous = period(prevRange, gran);
@@ -1004,6 +1019,8 @@ function matchNames(
       (v) => (aliases[lower] ?? []).includes(v),
       (v) => v.toLowerCase().includes(lower) || (v.length > 3 && lower.includes(v.toLowerCase())) || display(v).toLowerCase().includes(lower),
       (v) => words(lower).some((word) => word.length > 2 && words(display(v)).includes(singular(word))),
+      // Small typos: "jakets" → both jackets, "hoodei" → Heavyweight Hoodie.
+      (v) => words(lower).some((word) => word.length >= 5 && words(display(v)).some((w) => w[0] === word[0] && editDistance(singular(word), w) <= (w.length > 7 ? 2 : 1))),
     ];
     const hits = steps.map((test) => valid.filter(test)).find((h) => h.length);
     if (!hits) return { error: `There's no ${kind} called "${w}". Options: ${valid.map(display).join(", ")}.` };

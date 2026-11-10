@@ -97,13 +97,22 @@ export function routeQuestion(question: string, opts: { hasHistory?: boolean } =
   }
 
   // 5. Single totals → metric cards, unless the question asks for a breakdown or a trend.
-  if (TOTAL.test(q) && !BREAKDOWN.test(q) && !TREND.test(q) && !RANKING.test(q)) {
+  const grossOrDiscounts = /\b(gross( sales| revenue)?|sales before discount|discounts?)\b/i.test(q) && !(category || products);
+  if ((TOTAL.test(q) || grossOrDiscounts) && !BREAKDOWN.test(q) && !TREND.test(q) && !RANKING.test(q)) {
     return route("totalMetrics", { ...filters, metrics: pickMetrics(q) }, "totals");
   }
 
-  const aboutProducts = !!(category || products) || /\b(products?|items?|skus?|what'?s selling|what is selling|best[- ]?sellers?|top[- ]?selling)\b/i.test(q);
+  const aboutProducts =
+    !!(category || products) ||
+    /\b(products?|items?|skus?|what'?s selling|what is selling|best[- ]?sellers?|top[- ]?selling)\b/i.test(q) ||
+    /\bwhat'?s (slowing|selling|picking up|speeding up|dropping|declining|growing)\b|\bwhat (is|are) (slowing|selling|picking up|dropping)\b/i.test(q);
 
-  // 6. Products changing over time (slowing down, stopped selling, a product's trend) → product line chart.
+  // 6a. Two or more named products side by side ("compare the parka and the hoodie") → one line per product.
+  if ((products?.length ?? 0) >= 2 && !RANKING.test(q)) {
+    return route("productSalesOverTime", { ...filters, ...(granularity ? { granularity } : {}), ...(/\bunits\b/i.test(q) ? { measure: "units" } : {}) }, "compare products");
+  }
+
+  // 6b. Products changing over time (slowing down, stopped selling, a product's trend) → product line chart.
   if (aboutProducts && PRODUCT_TREND.test(q)) {
     const everything = !category && !products && /\b(what'?s|what is|which)\b/i.test(q);
     return route(
@@ -111,6 +120,15 @@ export function routeQuestion(question: string, opts: { hasHistory?: boolean } =
       { ...filters, ...(granularity ? { granularity } : {}), ...(/\bunits\b/i.test(q) && !/\bnot units\b/i.test(q) ? { measure: "units" } : {}), ...(everything ? { limit: 12 } : {}) },
       "product trend",
     );
+  }
+
+  // 6c. "How is the parka doing", "how did the online store do in July" → that product's or channel's sales over time.
+  const howDoing = /\b(doing|done|do|did|perform(ing|ed|ance)?|going)\b/i.test(q) && /^\s*how\b/i.test(q);
+  if (howDoing && (category || products)) {
+    return route("productSalesOverTime", { ...filters, ...(granularity ? { granularity } : {}) }, "how is a product doing");
+  }
+  if (howDoing && channels?.length === 1) {
+    return route("salesOverTime", { ...filters, ...(granularity ? { granularity } : {}) }, "how is a channel doing");
   }
 
   // 7. Ranking products or SKUs in one period → bar chart.

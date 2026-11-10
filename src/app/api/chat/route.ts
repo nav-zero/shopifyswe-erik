@@ -7,9 +7,13 @@
  * for the dashboard to draw. The model must call a tool and never writes text,
  * so everything the user sees comes from the data.
  *
- * Questions about data we don't have get a fixed reply and two suggested
- * questions, without calling the model. The suggestions also arrive as a
- * `data-suggestions` part so the UI can show them as buttons.
+ * Order of checks, cheapest and most certain first:
+ *   1. Fix small typos ("jakets" → "jackets"), reported as a `data-corrected` part.
+ *   2. Data we don't have → fixed reply plus two suggestions (`data-suggestions`).
+ *   3. Vague dates or an unknown product → a clarifying question (`data-clarify`).
+ *   4. Common question shapes → the rules in router.ts run the tool directly.
+ *   5. Everything else → the model picks the tool.
+ * Steps 1–4 never call the model.
  */
 
 import { createOpenRouter } from "@openrouter/ai-sdk-provider";
@@ -21,17 +25,11 @@ import {
   streamText,
   toUIMessageStream,
 } from "ai";
-import {
-  cannotAnswer,
-  cannotAnswerText,
-  chatTools,
-  detectUnsupported,
-  runTool,
-  systemPrompt,
-  type ChatMessage,
-} from "@/lib/chat-tools";
+import { cannotAnswer, cannotAnswerText, chatTools, runTool, systemPrompt, type ChatMessage } from "@/lib/chat-tools";
+import type { Clarification } from "@/lib/clarify";
 import { describeError } from "@/lib/errors";
-import { routeQuestion } from "@/lib/router";
+import type { Correction } from "@/lib/fuzzy";
+import { planAnswer } from "@/lib/plan";
 import { getModel } from "@/lib/openrouter";
 
 // Free models can be slow to start; give the stream room to finish.
@@ -56,17 +54,15 @@ async function answer(req: Request) {
     return Response.json({ error: "The request was malformed: the server expected a JSON body like { messages: [...] }." }, { status: 400 });
   }
 
-  // 1. Data we don't have → fixed reply, no model call. Deterministic and free.
-  const question = latestUserText(messages);
-  if (detectUnsupported(question)) {
-    return replyWithoutModel(cannotAnswer(question));
-  }
-
-  // 2. Common question shapes → run the tool directly, no model call (see router.ts).
-  //    Saves the free model's 50-a-day allowance for questions the rules can't read.
+  // Steps 1–4 (typos, no-data reply, clarifying questions, rules) never call the model; see plan.ts.
   // `skipRules` (used by `npm run check:guide -- --live`) sends the question to the model anyway.
-  const routed = skipRules ? null : routeQuestion(question, { hasHistory: messages.length > 1 });
-  if (routed) return replyWithTool(routed.tool, routed.input, question);
+  const plan = planAnswer(latestUserText(messages), { hasHistory: messages.length > 1, skipRules });
+  const { question, corrections } = plan;
+  if (corrections.length) messages = withLatestUserText(messages, question);
+  if (plan.kind === "unsupported") return replyWithoutModel(plan.result);
+  if (plan.kind === "clarify") return replyWithClarification(plan.clarification, corrections);
+  // Saves the free model's 50-a-day allowance for questions the rules can't read.
+  if (plan.kind === "tool") return replyWithTool(plan.route.tool, plan.route.input, question, corrections);
 
   // Locally this comes from .env.local; on Vercel, from the project's environment variables.
   const apiKey = process.env.OPENROUTER_API_KEY;
@@ -78,7 +74,7 @@ async function answer(req: Request) {
   }
   const openrouter = createOpenRouter({ apiKey, fetch: failFastOnDailyLimit });
 
-  // 3. Everything else → the model picks a tool; the tool's visual is the answer.
+  // 5. Everything else → the model picks a tool; the tool's visual is the answer.
   const result = streamText({
     model: openrouter(getModel()),
     instructions: systemPrompt(),
@@ -95,16 +91,43 @@ async function answer(req: Request) {
     maxRetries: 4,
   });
 
-  return createUIMessageStreamResponse({
-    stream: toUIMessageStream<typeof chatTools, ChatMessage>({
-      stream: result.stream,
-      tools: chatTools,
-      originalMessages: messages,
-      // The model "thinks" before answering; keep that out of the user's chat.
-      sendReasoning: false,
-      onError: friendlyError,
-    }),
+  const modelStream = toUIMessageStream<typeof chatTools, ChatMessage>({
+    stream: result.stream,
+    tools: chatTools,
+    originalMessages: messages,
+    // The model "thinks" before answering; keep that out of the user's chat.
+    sendReasoning: false,
+    onError: friendlyError,
   });
+  if (!corrections.length) return createUIMessageStreamResponse({ stream: modelStream });
+  const stream = createUIMessageStream<ChatMessage>({
+    execute: ({ writer }) => {
+      writer.merge(modelStream);
+      writer.write({ type: "data-corrected", data: { corrections } });
+    },
+  });
+  return createUIMessageStreamResponse({ stream });
+}
+
+function replyWithClarification(clarification: Clarification, corrections: Correction[]) {
+  const stream = createUIMessageStream<ChatMessage>({
+    execute: ({ writer }) => {
+      writer.write({ type: "start" });
+      if (corrections.length) writer.write({ type: "data-corrected", data: { corrections } });
+      writer.write({ type: "data-clarify", data: clarification });
+      writer.write({ type: "finish", finishReason: "stop" });
+    },
+  });
+  return createUIMessageStreamResponse({ stream });
+}
+
+/** Replaces the latest user message's text, so the model reads the typo-corrected question. */
+function withLatestUserText(messages: ChatMessage[], text: string): ChatMessage[] {
+  const i = messages.map((m) => m.role).lastIndexOf("user");
+  if (i === -1) return messages;
+  const copy = [...messages];
+  copy[i] = { ...copy[i], parts: [{ type: "text", text }] };
+  return copy;
 }
 
 function replyWithoutModel(result: ReturnType<typeof cannotAnswer>) {
@@ -123,11 +146,12 @@ function replyWithoutModel(result: ReturnType<typeof cannotAnswer>) {
 }
 
 /** Streams one tool result in the same format the model path uses, so the dashboard can't tell the difference. */
-function replyWithTool(tool: string, input: Record<string, unknown>, question: string) {
+function replyWithTool(tool: string, input: Record<string, unknown>, question: string, corrections: Correction[]) {
   const stream = createUIMessageStream<ChatMessage>({
     execute: async ({ writer }) => {
       const toolCallId = `rule-${crypto.randomUUID()}`;
       writer.write({ type: "start" });
+      if (corrections.length) writer.write({ type: "data-corrected", data: { corrections } });
       writer.write({ type: "tool-input-available", toolCallId, toolName: tool, input });
       try {
         writer.write({ type: "tool-output-available", toolCallId, output: await runTool(tool, input, question) });

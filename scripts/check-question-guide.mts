@@ -4,10 +4,13 @@
  *   npm run check:guide               Offline: each example passes the "no data" guard,
  *                                     its input is valid for its tool, the tool runs on
  *                                     the CSV, the chart type matches the category, and
- *                                     the rules in router.ts either pick the same tool or
- *                                     leave it to the model. Also checks that every starter
+ *                                     planAnswer() (typo fixes, clarifying questions, the
+ *                                     rules in router.ts) either picks the same tool or leaves
+ *                                     it to the model. Vague examples must ask the expected
+ *                                     clarifying question, and picking its first option must
+ *                                     lead to the expected tool. Also checks that every starter
  *                                     and suggested question on the dashboard is answered
- *                                     by the rules.
+ *                                     without the model.
  *   npm run check:guide -- --live     Also asks the model (via the running dev server) about
  *                                     the examples the rules leave to it.
  *   npm run check:guide -- --live-all Asks the model about every example, skipping the rules.
@@ -20,7 +23,7 @@
 
 import { chatTools, detectUnsupported, type ToolName } from "../src/lib/chat-tools";
 import { QUESTION_GUIDE, STARTER_QUESTIONS, SUPPORTED_QUESTIONS } from "../src/lib/question-guide";
-import { routeQuestion } from "../src/lib/router";
+import { planAnswer } from "../src/lib/plan";
 
 type AnyTool = {
   inputSchema: { safeParse: (v: unknown) => { success: boolean; error?: { message: string } } };
@@ -46,21 +49,36 @@ for (const category of QUESTION_GUIDE) {
     if (!parsed.success) problems.push(`invalid input: ${parsed.error?.message}`);
 
     examples++;
-    const routed = routeQuestion(ex.question);
-    if (routed && routed.tool !== ex.tool) problems.push(`the rules pick ${routed.tool} (${routed.rule}), the guide says ${ex.tool}`);
-    if (routed) byRules++;
+    // Follow clarifying questions by picking the first option, as a merchant might.
+    let plan = planAnswer(ex.question);
+    let asked = ex.question;
+    const steps: string[] = [];
+    const firstAsk = plan.kind === "clarify" ? plan.clarification.kind : null;
+    for (let i = 0; plan.kind === "clarify" && i < 3; i++) {
+      steps.push(`asks "${plan.clarification.prompt}" → picks "${plan.clarification.options[0].label}"`);
+      asked = plan.clarification.options[0].question;
+      plan = planAnswer(asked);
+    }
+    if (ex.clarifies && firstAsk !== ex.clarifies) problems.push(`should ask a ${ex.clarifies} question first, but ${firstAsk ? `asks a ${firstAsk} question` : "doesn't ask"}`);
+    if (!ex.clarifies && firstAsk) problems.push(`asks a ${firstAsk} clarifying question, but the guide expects a direct answer`);
+    if (plan.kind === "clarify") problems.push("still asking clarifying questions after 3 answers");
+    if (plan.kind === "unsupported") problems.push("gets the 'no data' reply");
+    if (plan.kind === "tool" && plan.route.tool !== ex.tool) problems.push(`the rules pick ${plan.route.tool} (${plan.route.rule}), the guide says ${ex.tool}`);
+    if (plan.kind === "tool") byRules++;
 
-    const out = await t.execute(ex.input, { toolCallId: "check", messages: [{ role: "user", content: ex.question }], context: {} });
+    const out = await t.execute(ex.input, { toolCallId: "check", messages: [{ role: "user", content: asked }], context: {} });
     if (!out.ok) problems.push(`tool error: ${out.error}`);
     else if (!category.chart.includes(out.chart!.type)) problems.push(`chart is ${out.chart!.type}, category expects ${category.chart}`);
 
     console.log(`\n${problems.length ? "FAIL" : "ok  "} "${ex.question}"\n     → ${ex.tool} ${JSON.stringify(ex.input)}${out.ok ? ` [${out.chart!.type}]` : ""}`);
-    console.log(`     rules: ${routed ? `${routed.tool} ${JSON.stringify(routed.input)} (${routed.rule})` : "none, the model decides"}`);
+    for (const s of steps) console.log(`     ${s}`);
+    if (plan.corrections.length) console.log(`     typos: ${plan.corrections.map((c) => `${c.from} → ${c.to}`).join(", ")}`);
+    console.log(`     rules: ${plan.kind === "tool" ? `${plan.route.tool} ${JSON.stringify(plan.route.input)} (${plan.route.rule})` : plan.kind === "model" ? "none, the model decides" : plan.kind}`);
     for (const p of problems) console.log(`     ! ${p}`);
     if (out.ok) console.log(indent(out.summary!));
     if (problems.length) failures++;
 
-    if (liveAll || (live && !routed)) {
+    if (!ex.clarifies && (liveAll || (live && plan.kind === "model"))) {
       try {
         const picked = await askModel(ex.question);
         const match = picked.tool === ex.tool;
@@ -77,15 +95,16 @@ for (const category of QUESTION_GUIDE) {
 // Questions the dashboard itself offers (starter chips and "can't answer" suggestions) must work without the model.
 console.log("\n=== Questions the dashboard suggests (must be answered by the rules)");
 for (const q of [...STARTER_QUESTIONS, ...Object.values(SUPPORTED_QUESTIONS)]) {
-  const routed = routeQuestion(q);
+  const plan = planAnswer(q);
+  const routed = plan.kind === "tool" ? plan.route : null;
   const out = routed ? await (chatTools[routed.tool] as unknown as AnyTool).execute(routed.input, { toolCallId: "check", messages: [{ role: "user", content: q }], context: {} }) : null;
   const good = !!routed && !!out?.ok && !detectUnsupported(q);
   if (!good) failures++;
-  console.log(`${good ? "ok  " : "FAIL"} "${q}" → ${routed ? `${routed.tool} [${out?.ok ? out.chart!.type : `error: ${out?.error}`}]` : "no rule matched"}`);
+  console.log(`${good ? "ok  " : "FAIL"} "${q}" → ${routed ? `${routed.tool} [${out?.ok ? out.chart!.type : `error: ${out?.error}`}]` : plan.kind === "clarify" ? "asks a clarifying question" : "no rule matched"}`);
 }
 
 console.log(
-  `\n${failures ? `${failures} check(s) failed` : "All checks passed"}. The rules answer ${byRules} of ${examples} guide examples without the model.` +
+  `\n${failures ? `${failures} check(s) failed` : "All checks passed"}. ${byRules} of ${examples} guide examples are answered without the model.` +
     (live ? ` Model picked a different tool for ${liveMismatches}.` : ""),
 );
 process.exit(failures ? 1 : 0);

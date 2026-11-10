@@ -209,8 +209,13 @@ export function resolveDateRange(text: string, today: string = getToday()): Date
   // "last month compared to the month before": the period asked about comes
   // first. If that part has no dates ("compare Canada vs the US this season"),
   // read the whole text.
-  const { main } = splitComparison(text);
-  return resolveSingle(main, today) ?? (main !== text ? resolveSingle(text, today) : null);
+  const { main, other } = splitComparison(text);
+  const asked = resolveSingle(main, today);
+  if (asked) return asked;
+  // "parka sales vs last month": no period stated, so it's this month so far against last month.
+  const rel = other?.match(/^\s*(?:the\s+)?(?:last|previous|prior)\s+(week|month|quarter|year)\b/i);
+  if (rel) return resolveSingle(`this ${rel[1].toLowerCase()}`, today);
+  return main !== text ? resolveSingle(text, today) : null;
 }
 
 function resolveSingle(text: string, today: string): DateRange | null {
@@ -241,6 +246,9 @@ function resolveSingle(text: string, today: string): DateRange | null {
   // "last 10 days", "past 2 weeks", "previous 3 months"
   const n = t.match(/\b(?:last|past|previous|trailing)\s+(\d+)\s+(day|week|month)s?\b/);
   if (n) return rolling(Number(n[1]), n[2] as "day" | "week" | "month", today);
+  // "past few weeks" = 3, "last couple of months" = 2, "past several days" = 5. The chart shows the exact dates.
+  const fuzzyN = t.match(/\b(?:last|past|previous)\s+(couple(?:\s+of)?|few|several)\s+(day|week|month)s?\b/);
+  if (fuzzyN) return rolling(fuzzyN[1].startsWith("couple") ? 2 : fuzzyN[1] === "few" ? 3 : 5, fuzzyN[2] as "day" | "week" | "month", today);
 
   if (/\b(?:previous|prior|last) calendar month\b/.test(t)) {
     const end = addDays(`${today.slice(0, 7)}-01`, -1);
@@ -285,7 +293,7 @@ function resolveSingle(text: string, today: string): DateRange | null {
   if (/\b(?:this|current) season\b/.test(t)) return season(currentSeason(today), today, false);
   // Only in date-like wording, so "winter jackets" or "summer dresses" aren't read as dates.
   const s =
-    t.match(/\b(?:in|during|this|last|since|over|for|through|until|throughout|(?:start|beginning|end) of)\s+(?:the\s+)?(spring|summer|autumn|fall|winter)\b/) ??
+    t.match(/\b(?:in|during|this|last|since|over|for|through|until|throughout|(?:start|beginning|end) of)\s+(?:the\s+)?(spring|summer|autumn|fall|winter)\b(?!\s+(?:jackets?|coats?|clothes|clothing|collection|items?|products?|wear|gear|styles?|sweaters?|hats?|boots?|line|range|stock|lineup))/) ??
     t.match(/\b(spring|summer|autumn|fall|winter)\s+(?:\d{4}|so far)\b/) ??
     t.match(/^\s*(spring|summer|autumn|fall|winter)\s*$/);
   if (s) return season(s[1] as Season, today, /\bsince\b/.test(t));
@@ -1036,20 +1044,18 @@ export function detectFilters(q: string, lines: OrderLine[]): Filters {
   for (const [re, v] of CATEGORY_WORDS) if (re.test(q)) push("product_category", v);
   for (const [re, v] of STATUS_WORDS) if (re.test(q)) push("financial_status", v);
 
-  // Products by full title, last two words ("down parka"), or a last word that
-  // only one product uses ("parka", but not "jacket").
+  // Products by full title, last two words ("down parka"), or a distinctive word
+  // that only one product uses ("parka", "fleece", "merino", but not "jacket").
+  // Plain words that happen to be in a title ("down", "rain", "camp") don't count on their own.
   const lower = q.toLowerCase();
   const titles = [...new Set(lines.map((l) => l.productTitle))];
-  const lastWordCount = new Map<string, number>();
-  for (const t of titles) {
-    const w = t.toLowerCase().split(" ").at(-1)!;
-    lastWordCount.set(w, (lastWordCount.get(w) ?? 0) + 1);
-  }
+  const wordCount = new Map<string, number>();
+  for (const t of titles) for (const w of new Set(t.toLowerCase().split(" "))) wordCount.set(w, (wordCount.get(w) ?? 0) + 1);
+  const plain = new Set(["down", "rain", "wool", "camp", "crew", "cable", "everyday", "organic"]);
   for (const t of titles) {
     const words = t.toLowerCase().split(" ");
-    const last = words.at(-1)!;
     const candidates = [words.join(" "), words.slice(-2).join(" ")];
-    if (lastWordCount.get(last) === 1) candidates.push(last);
+    for (const w of words) if (wordCount.get(w) === 1 && w.length >= 3 && !plain.has(w)) candidates.push(w);
     if (candidates.some((c) => new RegExp(`\\b${escapeRe(c)}s?\\b`).test(lower))) push("product_title", t);
   }
   for (const sku of new Set(lines.map((l) => l.sku))) if (lower.includes(sku.toLowerCase())) push("sku", sku);

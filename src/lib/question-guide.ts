@@ -54,6 +54,12 @@ export interface GuideExample {
   input: Record<string, unknown>;
   /** What the answer can and can't say, when that isn't obvious. */
   note?: string;
+  /**
+   * The question is too vague to chart as asked, so the dashboard first asks a
+   * clarifying question ("date": which dates; "product": which product). `tool`
+   * and `input` are what it ends up using after the first option is picked.
+   */
+  clarifies?: "date" | "product";
 }
 
 export interface GuideCategory {
@@ -79,8 +85,9 @@ export const QUESTION_GUIDE: GuideCategory[] = [
       {
         question: "what's selling slower than usual since the start of summer",
         tool: "productSalesOverTime",
-        input: { period: "since the start of summer", limit: 12 },
-        note: "About products, so it uses the product tool. There's no data before June, so 'usual' is the first half of the period.",
+        input: { limit: 12 },
+        clarifies: "date",
+        note: "Asks which dates first, since seasons depend on hemisphere. About products, so it uses the product tool. With no data before June, 'usual' is the first half of the period.",
       },
       {
         question: "show me daily sales for the past 7 days, i think friday was off",
@@ -110,8 +117,9 @@ export const QUESTION_GUIDE: GuideCategory[] = [
       {
         question: "compare sales in canada vs the US this season",
         tool: "salesByCountryOverTime",
-        input: { period: "this season", countries: ["Canada", "US"] },
-        note: "'Canada vs the US' compares countries, not periods. 'This season' is autumn so far (1–21 Sep); seasons are meteorological.",
+        input: { countries: ["Canada", "US"] },
+        clarifies: "date",
+        note: "'Canada vs the US' compares countries, not periods. 'This season' is vague, so it asks which dates first.",
       },
       {
         question: "revenue by country for the past 7 days plz",
@@ -205,6 +213,18 @@ export const QUESTION_GUIDE: GuideCategory[] = [
         note: "There's no weather data, so the answer compares with the week before rather than confirming the cold snap.",
       },
       {
+        question: "which jakets are selling best in the last 30 days need to pick colours",
+        tool: "productsByRevenue",
+        input: { period: "last 30 days", category: "Outerwear" },
+        note: "'jakets' is corrected to 'jackets' (the Outerwear category). The data has no colours, so the chart can't help pick them.",
+      },
+      {
+        question: "compare the parka and the hoodie over the past few weeks",
+        tool: "productSalesOverTime",
+        input: { period: "past few weeks", products: ["Summit Down Parka", "Heavyweight Hoodie"] },
+        note: "One line per product. 'Past few weeks' is the last 3 weeks; the chart shows the exact dates.",
+      },
+      {
         question: "which tees stopped selling this month compared to last month",
         tool: "productSalesOverTime",
         input: { period: "this month", products: ["tee"], compareWithPrevious: true },
@@ -253,12 +273,51 @@ export const QUESTION_GUIDE: GuideCategory[] = [
       },
     ],
   },
+  {
+    name: "Needs a clarifying question",
+    about:
+      "Questions that can't be charted as asked: a season instead of dates, a comparison with only one side, or a product that isn't in the store. " +
+      "The dashboard asks a clarifying question with options, then draws the chart.",
+    chart: "line",
+    examples: [
+      {
+        question: "What's slowing down since summer?",
+        tool: "productSalesOverTime",
+        input: { limit: 12 },
+        clarifies: "date",
+      },
+      {
+        question: "Which vests and fleeces have slowed down compared to July?",
+        tool: "productSalesOverTime",
+        input: { products: ["Trailhead Fleece Jacket"] },
+        clarifies: "product",
+        note: "There are no vests in the store, so it asks which product was meant (or to leave vests out), then which period to compare with July.",
+      },
+      {
+        question: "What's my weekly revenue trend over the summer, is it going up or down",
+        tool: "salesOverTime",
+        input: { granularity: "week" },
+        clarifies: "date",
+      },
+      {
+        question: "Can you compare the Big Cozy and the Classic Crew sweatshirt over the past few weeks",
+        tool: "productSalesOverTime",
+        input: { period: "past few weeks", products: ["Merino Crew Sweater"] },
+        clarifies: "product",
+        note: "Neither product is in the store, so it asks about each in turn; Merino Crew Sweater is offered first for 'Classic Crew sweatshirt'. Then one line per product.",
+      },
+    ],
+  },
 ];
 
 /** The guide as plain text for the system prompt: categories, then each example as a tool call. */
 export function guideForPrompt(guide: GuideCategory[] = QUESTION_GUIDE): string {
-  const sections = guide.map((c) => {
-    const examples = c.examples.map((e) => `  Q: "${e.question}" → ${e.tool} ${JSON.stringify(e.input)}`).join("\n");
+  const sections = guide.filter((c) => c.examples.some((e) => !e.clarifies)).map((c) => {
+    // Vague examples are answered by a clarifying question before the model is involved, so the model doesn't need them.
+    const examples = c.examples
+      .filter((e) => !e.clarifies)
+      .map((e) => `  Q: "${e.question}" → ${e.tool} ${JSON.stringify(e.input)}`)
+      .join("\n");
     return `${c.name} (${c.chart} chart): ${c.about}\n${examples}`;
   });
   return `Question guide: question types, with example questions and the tool call to make.\n\n${sections.join("\n\n")}`;

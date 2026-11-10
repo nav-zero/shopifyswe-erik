@@ -11,6 +11,10 @@
  */
 
 import type { ChartSpec } from "./charts";
+import type { Clarification } from "./clarify";
+import type { Correction } from "./fuzzy";
+
+export type { Clarification, Correction };
 
 // ---------------------------------------------------------------------------
 // Types (mirror the tool outputs in chat-tools.ts; type-only so no server code ships)
@@ -53,6 +57,10 @@ export interface Entry {
   failure?: string;
   /** Why nothing could be shown when the question finished without a visual (e.g. the model chose no chart). */
   reason?: string;
+  /** A clarifying question to answer before a chart can be drawn (vague dates, unknown product). */
+  clarify?: Clarification;
+  /** Typos fixed before answering, shown as a small note. */
+  corrections?: Correction[];
   askedAt: string;
 }
 
@@ -153,7 +161,7 @@ export async function askQuestion(
   history: Entry[],
   onResult: (r: ToolResult) => void,
   signal?: AbortSignal,
-): Promise<{ results: ToolResult[]; suggestions?: string[]; reason?: string }> {
+): Promise<{ results: ToolResult[]; suggestions?: string[]; reason?: string; clarify?: Clarification; corrections?: Correction[] }> {
   const messages = [];
   // Earlier questions on this dashboard, and what was shown for them. Last few only, to keep the prompt small.
   for (const e of history.filter((h) => h.status === "done").slice(-4)) {
@@ -169,6 +177,8 @@ export async function askQuestion(
 
   const results = new Map<string, ToolResult>();
   let suggestions: string[] | undefined;
+  let clarify: Clarification | undefined;
+  let corrections: Correction[] | undefined;
   let streamError: string | undefined;
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
@@ -207,6 +217,10 @@ export async function askQuestion(
         const r = { ...(results.get(id) ?? { toolCallId: id, tool: "unknown", input: {} }), output: { ok: false, error: reason, suggestions: [] } as ToolOutput };
         results.set(id, r);
         onResult(r);
+      } else if (part.type === "data-clarify") {
+        clarify = part.data as Clarification;
+      } else if (part.type === "data-corrected") {
+        corrections = (part.data as { corrections: Correction[] }).corrections;
       } else if (part.type === "data-suggestions") {
         suggestions = (part.data as { questions: string[] }).questions;
       } else if (part.type === "error") {
@@ -218,15 +232,15 @@ export async function askQuestion(
   }
   const done = [...results.values()].filter((r) => r.output);
   // An error with nothing to show means the request failed (e.g. rate limit) rather than "can't answer".
-  if (streamError && !done.length && !suggestions) throw new Error(streamError);
-  if (!finished && !streamError && !done.length && !suggestions) {
+  if (streamError && !done.length && !suggestions && !clarify) throw new Error(streamError);
+  if (!finished && !streamError && !done.length && !suggestions && !clarify) {
     throw new Error("The connection to the server closed before the answer finished. Try again.");
   }
   const reason =
-    !done.length && !suggestions
+    !done.length && !suggestions && !clarify
       ? streamError ?? "The model didn't choose a chart for this question, so there's nothing to show. Try rephrasing it."
       : undefined;
-  return { results: done, suggestions, reason };
+  return { results: done, suggestions, reason, clarify, corrections };
 }
 
 /** fetch with a specific message when the server can't be reached at all. */

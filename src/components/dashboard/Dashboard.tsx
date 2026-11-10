@@ -44,11 +44,11 @@ export function Dashboard() {
 
   async function run(dashboardId: string, entryId: string, question: string, history: Entry[]) {
     try {
-      const { results, suggestions, reason } = await askQuestion(question, history, (r) =>
+      const { results, suggestions, reason, clarify, corrections } = await askQuestion(question, history, (r) =>
         // Show each visual as soon as it arrives.
         updateEntry(dashboardId, entryId, (e) => ({ ...e, results: [...e.results.filter((x) => x.toolCallId !== r.toolCallId), r] })),
       );
-      updateEntry(dashboardId, entryId, (e) => ({ ...e, status: "done", results, suggestions, reason }));
+      updateEntry(dashboardId, entryId, (e) => ({ ...e, status: "done", results, suggestions, reason, clarify, corrections }));
       if (today) updateDashboard(dashboardId, (d) => ({ ...d, asOf: d.asOf ?? today }));
     } catch (err) {
       updateEntry(dashboardId, entryId, (e) => ({ ...e, status: "failed", failure: (err as Error).message }));
@@ -74,11 +74,24 @@ export function Dashboard() {
     void run(dashboardId, entry.id, question, history);
   }
 
-  function retry(entry: Entry) {
+  /** Re-asks an entry in place: for "Try again", or with a clarified question (picked dates or product). */
+  function retry(entry: Entry, question = entry.question) {
     if (!active || busy) return;
     const history = active.entries.slice(0, active.entries.findIndex((e) => e.id === entry.id));
-    updateEntry(active.id, entry.id, (e) => ({ ...e, status: "loading", results: [], suggestions: undefined, failure: undefined, reason: undefined }));
-    void run(active.id, entry.id, entry.question, history);
+    updateEntry(active.id, entry.id, (e) => ({
+      ...e,
+      question,
+      status: "loading",
+      results: [],
+      suggestions: undefined,
+      failure: undefined,
+      reason: undefined,
+      clarify: undefined,
+      corrections: undefined,
+    }));
+    // A clarified first question also renames the dashboard.
+    if (active.entries[0]?.id === entry.id && question !== entry.question) updateDashboard(active.id, (d) => ({ ...d, title: question }));
+    void run(active.id, entry.id, question, history);
   }
 
   async function update() {
@@ -203,6 +216,7 @@ export function Dashboard() {
                     entry={e}
                     onAsk={ask}
                     onRetry={() => retry(e)}
+                    onClarify={(q) => retry(e, q)}
                     onRemove={() => updateDashboard(active.id, (d) => ({ ...d, entries: d.entries.filter((x) => x.id !== e.id) }))}
                   />
                 ))}
