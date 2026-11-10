@@ -45,20 +45,17 @@ export interface OrderLine {
   inventoryOnHandAtOrder: number; // P  inventory_on_hand_at_order
 }
 
-export const DATA_FILE = path.join(
-  process.cwd(),
-  "data",
-  "merchant-order-history-2025-06-01-to-2025-09-21.csv",
-);
-
 let cachedLines: OrderLine[] | null = null;
 
 /** Loads and parses the CSV once per server process. */
-export function loadOrderLines(file: string = DATA_FILE): OrderLine[] {
-  if (file === DATA_FILE && cachedLines) return cachedLines;
-  const lines = parseOrderCsv(readFileSync(file, "utf8"));
-  if (file === DATA_FILE) cachedLines = lines;
-  return lines;
+export function loadOrderLines(): OrderLine[] {
+  // Keep this path written out in full, right inside readFileSync. The build
+  // reads it to decide which files ship with the API routes on Vercel; a path
+  // passed in as a variable makes it bundle the whole project instead.
+  cachedLines ??= parseOrderCsv(
+    readFileSync(path.join(process.cwd(), "data", "merchant-order-history-2025-06-01-to-2025-09-21.csv"), "utf8"),
+  );
+  return cachedLines;
 }
 
 export function parseOrderCsv(text: string): OrderLine[] {
