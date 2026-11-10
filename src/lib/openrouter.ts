@@ -11,14 +11,16 @@
 const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
 
 /**
- * Default model: Liquid AI's LFM3 1.7B, free tier. It's small and fast, has a
- * 256K-token context, and supports tool calling and structured (JSON) output.
- * Set OPENROUTER_MODEL in .env.local to try another model without code changes.
+ * Default model: Google's Gemma 4 26B A4B, free tier. A mixture-of-experts model
+ * (about 4B parameters active per token, so it stays fast) with a 256K-token
+ * context and tool calling, which is all the dashboard needs: it only picks a
+ * tool. Set OPENROUTER_MODEL to try another model without code changes. Every
+ * OpenRouter model works with the same API key.
  *
  * Note: OpenRouter's free models may retain prompts and outputs, so don't send
  * anything sensitive through them.
  */
-export const DEFAULT_MODEL = "liquid/lfm-3-1.7b:free";
+export const DEFAULT_MODEL = "google/gemma-4-26b-a4b-it:free";
 
 export function getModel(): string {
   return process.env.OPENROUTER_MODEL || DEFAULT_MODEL;
