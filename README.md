@@ -1,36 +1,101 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Merchant Analytics
 
-## Getting Started
+A dashboard where a merchant asks questions about their store in plain English and gets charts back. Ask "how did sales trend last month compared to the month before?" or "show units sold next to inventory on hand", and the answer comes back as a line chart, bar chart, table or metric cards, built from the store's order data.
 
-First, run the development server:
+The data is the merchant order history in [`data/`](data/): 3,000 order line items from 1 June to 21 September 2025.
+
+## How it works
+
+1. The merchant types a question on the home page.
+2. Questions about data the store doesn't have (ad spend, traffic, costs, profit, reviews) get a fixed reply straight away, without calling the model: *"Sorry, I can't answer that because I don't have the data."*, plus two questions it can answer.
+3. Everything else goes to a small language model ([`liquid/lfm-3-1.7b:free`](https://openrouter.ai/liquid/lfm-3-1.7b:free) on OpenRouter). Its only job is to pick a tool and pass the user's own words for the time period, such as "last week". It never writes the answer itself, so it can't make up numbers.
+4. The tool computes the numbers from the CSV and returns a description of the visual. The dashboard draws it.
+
+Each new question adds to the current dashboard. **New search** starts a fresh one, and past dashboards are listed in the history sidebar. History is saved in the browser.
+
+## What it can answer
+
+The question types, with real example questions and the tool call each should make, are in [`src/lib/question-guide.ts`](src/lib/question-guide.ts). The model reads this guide as worked examples.
+
+| Question type | Visual | Example |
+|---|---|---|
+| Sales over time | Line | "trend of weekly sales since june, are we actually growing" |
+| Sales by country over time | Line | "compare sales in canada vs the US this season" |
+| Sales by channel over time | Line | "how much of my revenue came from online store vs pos last month" |
+| Products by revenue | Bar | "top 5 products this week by revenue" |
+| Product returns over time | Line | "refund total for Q3 so far and which items drove it" |
+| Products over time | Line or bar | "which outerwear has been slowing down recently" |
+| Totals | Metric cards | "what was total net revenue last week" |
+| Product tables | Table | "show units sold next to inventory on hand for each product" |
+
+Which visual to use is decided in code, not by the model: anything over time is a line chart, side-by-side comparisons are bar charts, several numbers per item are tables, and single totals are metric cards.
+
+## Definitions
+
+These live in [`src/lib/metrics.ts`](src/lib/metrics.ts) and every number goes through them.
+
+- **Net sales** (what "sales" and "revenue" mean by default) = `line_total`. Unit price and line total are already after discount; some discounts are larger than the line total, which couldn't happen otherwise.
+- **Gross sales** = `line_total + discount_amount`. Used only when someone asks for gross or "before discount".
+- **Refunds / returns** = the `line_total` of fully refunded lines. Partially refunded lines are counted, but the export doesn't say how much was refunded, so they aren't given an amount.
+- **Inventory on hand** = the stock level recorded on each product's most recent order, so it's an estimate.
+- **Order counts** are approximate: the same `order_id` sometimes appears with different customers or dates in this export.
+- Amounts have no currency symbol, because the export doesn't say which currency it uses.
+
+## Dates
+
+"Today" is fixed at **21 September 2025**, the last day in the data, so "last week" means 15–21 September. Ranges include both their first and last day.
+
+The dashboard understands rolling periods ("past 7 days", "last month", "recently"), calendar periods ("this month", "Q3 so far", "in August"), weekends, seasons ("this season", "since the start of summer") and comparisons ("vs the month before"). Every period has a natural previous period to compare against.
+
+The **Update** button re-runs every chart on the dashboard for the current "today", without calling the model. To make dates follow the real calendar, set `ANALYTICS_TODAY=today`. Until the data runs up to the present day, that will give empty charts.
+
+## Setup
+
+Requires Node.js 20.9 or later.
 
 ```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+npm install
+cp .env.example .env.local
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Then add your OpenRouter key to `.env.local`:
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+| Variable | Required | What it does |
+|---|---|---|
+| `OPENROUTER_API_KEY` | Yes | Key from [openrouter.ai/keys](https://openrouter.ai/keys). Server-side only; never sent to the browser. |
+| `OPENROUTER_MODEL` | No | Use a different OpenRouter model. Defaults to `liquid/lfm-3-1.7b:free`. |
+| `ANALYTICS_TODAY` | No | The date that "today" and "last week" count from. Defaults to `2025-09-21`. Use `today` for the real date, or any `YYYY-MM-DD`. |
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+`.env.local` is git-ignored, so the key never gets committed.
 
-## Learn More
+## Scripts
 
-To learn more about Next.js, take a look at the following resources:
+| Command | What it does |
+|---|---|
+| `npm run dev` | Start the app for development. |
+| `npm run build` | Production build. |
+| `npm run lint` | Lint the code. |
+| `npm run check:guide` | Check every example in the question guide: its inputs are valid, its tool runs on the data, and it returns the right kind of visual. No model calls. |
+| `npm run check:guide -- --live` | Also send each example to the running app and check that the model picks the expected tool. |
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+## Deploying
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+The app is set up for Vercel. Add `OPENROUTER_API_KEY` (and optionally `ANALYTICS_TODAY`) in the project's environment variables. The CSV is bundled with the API routes through `outputFileTracingIncludes` in [`next.config.ts`](next.config.ts).
 
-## Deploy on Vercel
+The free model has a shared rate limit and a daily cap of 50 requests. When either is hit, the dashboard says so and offers a retry. OpenRouter credits raise the daily cap.
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+## Project structure
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+```
+data/                        Merchant order history CSV
+src/app/page.tsx             Home page: the dashboard
+src/app/api/chat/            Streams tool results for a question
+src/app/api/refresh/         Re-runs saved charts for the Update button
+src/components/dashboard/    Dashboard, question cards, loader, visuals
+src/lib/metrics.ts           Data loading, definitions, date rules
+src/lib/chat-tools.ts        The tools the model can call
+src/lib/question-guide.ts    Question types and examples the model learns from
+src/lib/charts.ts            The visual format tools return
+src/lib/dashboard-client.ts  Browser-side state, history and streaming
+scripts/                     The question guide check
+```
